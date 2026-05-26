@@ -48,7 +48,7 @@ CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downl
 PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Pipeline_Results"
 
 # --- 控制参数 ---
-TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','GJ 896 A','GJ 4274','COCONUTS-2 A']
+TARGET_SOURCES: List[str] = ['GJ 896 A','GJ 4274','COCONUTS-2 A']
 
 # 掩模半径（角秒）
 MASK_RADIUS: int = 15
@@ -267,10 +267,26 @@ def main() -> None:
                     break
             if not is_matched: continue
 
-        base_name = dir_name.split('_')[0]
+        dir_name = os.path.basename(folder)
+        # 用正则剔除文件夹名字里的所有下划线、空格、横杠，只保留纯字母和数字，并转小写
+        norm_dir = re.sub(r'[^a-zA-Z0-9]', '', dir_name).lower()
+
+        # 2. 目标源过滤
+        if TARGET_SOURCES:
+            is_matched = False
+            for target in TARGET_SOURCES:
+                norm_target = re.sub(r'[^a-zA-Z0-9]', '', target).lower()
+                if norm_target in norm_dir or norm_dir in norm_target:
+                    is_matched = True
+                    break
+            if not is_matched:
+                continue
+
+        # 3. 星表字典匹配
         matched_key = None
         for k in star_catalog_dict.keys():
-            if base_name.lower() in k.lower():
+            norm_k = re.sub(r'[^a-zA-Z0-9]', '', k).lower()
+            if norm_k in norm_dir or norm_dir in norm_k:
                 matched_key = k
                 break
 
