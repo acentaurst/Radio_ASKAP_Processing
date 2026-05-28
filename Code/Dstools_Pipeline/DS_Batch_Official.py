@@ -48,7 +48,7 @@ CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downl
 PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Pipeline_Results"
 
 # --- 控制参数 ---
-TARGET_SOURCES: List[str] = ['GJ 896 A','GJ 4274','COCONUTS-2 A']
+TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','GJ 4274','AU Mic']
 
 # 掩模半径（角秒）
 MASK_RADIUS: int = 15

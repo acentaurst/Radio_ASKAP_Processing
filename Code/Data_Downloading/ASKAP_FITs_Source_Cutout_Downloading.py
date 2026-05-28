@@ -50,7 +50,7 @@ star_df = star_df.drop_duplicates(subset=['hostname']).reset_index(drop=True)
 print(f"共有 {len(star_df)} 个独立的恒星源准备进行切片下载。")
 
 # 2.5 优先级排序区
-priority_list = ['Proxima Cen', 'AU Mic']
+priority_list = ['GJ 4274']
 
 if 'priority_list' in locals() and priority_list:
     star_df['priority'] = star_df['hostname'].apply(lambda x: 0 if x in priority_list else 1)
