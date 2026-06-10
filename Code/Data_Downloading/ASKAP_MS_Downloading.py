@@ -41,7 +41,7 @@ INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_dire
 FAILED_LIST_PATH = os.path.join(os.path.dirname(CASDA_BASE_PATH), '0.failed_ms_downloads_log.csv')
 
 # ————————————————— 核心控制参数 —————————————————
-TARGET_SOURCES = ['AU Mic', 'Proxima Cen', 'GJ 896 A', 'GJ 4274', 'COCONUTS-2 A', 'AF Lep', '2MASS J01033563-5515561 A', 'PZ Tel', 'AB Pic']
+TARGET_SOURCES = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel','ROXs 42 B','TOI-2992']
 
 MAX_RETRIES = 3
 BATCH_SIZE = 15  # 每次最多向服务器请求的文件数量，避免 414 URI Too Long
@@ -95,12 +95,12 @@ def process_source(src):
         pm_dec=src['sy_pmdec'] * un.mas / un.yr,
         frame='icrs',
         obstime=Time('J2015.5'),
-        distance=100 * un.pc  # 设置虚拟距离支持自行计算
+        distance=100 * un.pc
     )
 
     for attempt in range(MAX_RETRIES):
         try:
-            # 2角秒筛选
+            # === 1. 检索数据并锁定最佳波束 ===
             query = (
                 f"SELECT * FROM ivoa.obscore "
                 f"WHERE dataproduct_type = 'visibility' "
@@ -125,7 +125,7 @@ def process_source(src):
             unique_history_sbs = df_res['obs_id'].unique()
 
             files_to_download_indices = []
-            local_errors = []  # 用于收集因 t_min 缺失而跳过的局部错误
+            local_errors = []
 
             for sb in unique_history_sbs:
                 sb_df = df_res[df_res['obs_id'] == sb]
@@ -135,26 +135,20 @@ def process_source(src):
                 if pd.isna(mjd_val):
                     warn_msg = f"{sb} 缺失儒略历时间数据"
                     tqdm.write(f"源 {clean_hostname} 的 {sb} 缺失儒略历数据，无法进行历元推演。已记录。")
-                    # 将缺失记录添加到错误列表中，最终会汇总到 CSV
-                    local_errors.append({'Source': clean_hostname, 'Error': warn_msg})
-                    continue  # 直接跳过这个 SB，处理下一个
+                    # 【优化】补充 File 字段占位，保持字典结构一致
+                    local_errors.append({'Source': clean_hostname, 'File': 'Unknown', 'Error': warn_msg})
+                    continue
 
                 epoch = Time(mjd_val, format='mjd')
-
-                # 根据该历元时间，计算恒星真实坐标
                 pm_coords = source_coords.apply_space_motion(epoch)
-
-                # 提取这一批次 36 个波束的中心点
                 beam_coords = SkyCoord(sb_df['s_ra'].values, sb_df['s_dec'].values, unit=(un.deg, un.deg))
 
-                # 用修正后的 pm_coords 寻找距离最近的波束
                 separations = pm_coords.separation(beam_coords)
                 best_idx_in_sb = np.argmin(separations)
 
                 best_filename = sb_df['filename'].iloc[best_idx_in_sb]
                 global_idx = df_res.index[df_res['filename'] == best_filename].tolist()[0]
 
-                # 拼接文件名
                 sb_id_num = sb.replace('ASKAP-', '')
                 safe_orig_name = best_filename.split('/')[-1]
                 expected_local_name = f"{sb_id_num}_{safe_orig_name}"
@@ -168,10 +162,10 @@ def process_source(src):
 
             if not files_to_download_indices:
                 if local_errors:
-                    return True, f" [源 {clean_hostname}] 部分波束因缺失儒略历数据跳过，其余就绪。", local_errors
-                return True, f" [源 {clean_hostname}] 历元上的 {len(unique_history_sbs)} 个最佳波束已在源文件夹中就绪，跳过", []
+                    return True, f" [源 {clean_hostname}] 部分波束因缺失数据跳过，其余就绪。", local_errors
+                return True, f" [源 {clean_hostname}] 历元上的 {len(unique_history_sbs)} 个beams已就绪，跳过", []
 
-            # 分批切割下载列表，防止请求 URL 过长 (414 Error)
+            # === 2. 分批下载（核心修复区域） ===
             total_files = len(files_to_download_indices)
             downloaded_count = 0
 
@@ -180,44 +174,75 @@ def process_source(src):
                 indices_array = np.array(batch_indices)
                 download_table = results[indices_array]
 
-                url_list = casda.stage_data(download_table)
+                # 【核心修复 1】：预先提取当前批次的具体文件名，方便报错时精准记录
+                current_batch_files = []
+                for idx in batch_indices:
+                    row = results[idx]
+                    sb_num = row['obs_id'].replace('ASKAP-', '')
+                    fname = os.path.basename(row['filename'])
+                    current_batch_files.append(f"{sb_num}_{fname}")
 
-                if url_list:
-                    filelist = casda.download_files(url_list, savedir=CASDA_BASE_PATH)
+                # 【核心修复 2】：为单个批次设置局部重试与异常捕获，防止波及整个源
+                batch_success = False
+                batch_err_msg = ""
 
-                    if filelist:
-                        for downloaded_file in filelist:
-                            orig_basename = os.path.basename(downloaded_file)
-                            for idx in batch_indices:
-                                row = results[idx]
-                                if orig_basename in row['filename']:
-                                    sb_id_num = row['obs_id'].replace('ASKAP-', '')
-                                    final_path = os.path.join(source_dir, f"{sb_id_num}_{orig_basename}")
+                for inner_attempt in range(MAX_RETRIES):
+                    try:
+                        url_list = casda.stage_data(download_table)
+                        if url_list:
+                            filelist = casda.download_files(url_list, savedir=CASDA_BASE_PATH)
+                            if filelist:
+                                for downloaded_file in filelist:
+                                    orig_basename = os.path.basename(downloaded_file)
+                                    for idx in batch_indices:
+                                        row = results[idx]
+                                        if orig_basename in row['filename']:
+                                            sb_id_num = row['obs_id'].replace('ASKAP-', '')
+                                            final_path = os.path.join(source_dir, f"{sb_id_num}_{orig_basename}")
 
-                                    if os.path.exists(final_path): os.remove(final_path)
-                                    os.rename(downloaded_file, final_path)
-                                    downloaded_count += 1
-                                    break
-                else:
-                    tqdm.write(f" [警告] 源 {clean_hostname} 第 {i // BATCH_SIZE + 1} 批次 Staging 失败。")
+                                            if os.path.exists(final_path): os.remove(final_path)
+                                            os.rename(downloaded_file, final_path)
+                                            downloaded_count += 1
+                                            break
+                                batch_success = True
+                                break  # 批次下载成功，跳出局部重试
+                            else:
+                                raise Exception("文件下载返回为空列表")
+                        else:
+                            raise Exception("Staging 失败，未返回下载链接")
 
-            if downloaded_count > 0:
-                # 即使下载成功，也要把之前收集到的跳过错误一起返回保存
-                return True, f" [源 {clean_hostname}] 成功分批下载 {downloaded_count} 份数据。", local_errors
+                    except Exception as inner_e:
+                        batch_err_msg = str(inner_e)
+                        if inner_attempt < MAX_RETRIES - 1:
+                            time.sleep(10)  # 下载失败局部冷却
+                        else:
+                            pass  # 局部重试耗尽，跳出交由下方记录错误
+
+                # 【核心修复 3】：记录具体文件名，且使用 continue 继续下一个批次
+                if not batch_success:
+                    tqdm.write(f" [错误] 源 {clean_hostname} 第 {i // BATCH_SIZE + 1} 批次下载彻底失败。")
+                    for f_name in current_batch_files:
+                        local_errors.append({'Source': clean_hostname, 'File': f_name, 'Error': batch_err_msg})
+                    # 注意：这里没有 return，代码会进入下一次 for 循环，继续下载后续文件批次
+
+            # 所有批次循环结束评估结果
+            if downloaded_count > 0 or not local_errors:
+                return True, f" [源 {clean_hostname}] 成功分批获取 {downloaded_count} 份数据。", local_errors
             else:
-                return False, f" [源 {clean_hostname}] 无法获取下载链接 ", [{'Source': clean_hostname,
-                                                                             'Error': 'Staging failed across all batches'}] + local_errors
+                return False, f" [源 {clean_hostname}] 尝试下载，但所有批次均失败。", local_errors
 
         except Exception as e:
+            # 这里捕获的是 TAP 请求层面的全局灾难性异常
             err_msg = str(e)
             if any(k in err_msg for k in ["IncompleteRead", "Connection broken", "Timeout", "EOFError", "time out"]):
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(15)
                     continue
-            return False, f" [源 {clean_hostname}] 错误: {err_msg}", [{'Source': clean_hostname, 'Error': err_msg}]
+            return False, f" [源 {clean_hostname}] 全局网络错误: {err_msg}", [
+                {'Source': clean_hostname, 'File': 'Global Error', 'Error': err_msg}]
 
-    return False, f" [源 {clean_hostname}] 连续 {MAX_RETRIES} 次重试失败", [
-        {'Source': clean_hostname, 'Error': 'Max retries reached'}]
+    return False, f" [源 {clean_hostname}] 连续 {MAX_RETRIES} 次全局重试均失败", [
+        {'Source': clean_hostname, 'File': 'Global Error', 'Error': 'Max retries reached'}]
 
 
 # ————————————————— 4. 执行单线程安全循环 —————————————————

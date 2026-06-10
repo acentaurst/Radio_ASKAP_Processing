@@ -2,13 +2,13 @@ import sys
 import os
 import shutil
 import runpy
-import glob
 import re
+import glob
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# 📂 路径与参数 (自适应项目根目录机制)
+# 路径与参数
 def project_path(relative_path: str) -> str:
     """自适应项目根目录定位"""
     current = os.path.abspath(os.path.dirname(__file__))
@@ -20,29 +20,52 @@ def project_path(relative_path: str) -> str:
     return os.path.join(current, relative_path)
 
 
-PIPELINE_RESULTS_DIR = project_path('Pipeline_Results/GJ_4274/DS_Results')
-# 图像输出的全局根目录
+# 管线产生 .ds 成果的目录
+PIPELINE_RESULTS_DIR = project_path('Pipeline_Results/2MASS_J01033563-5515561_A/DS_Results')
+
+# 图像输出的全局根目录 (按源建立专属画廊)
 MASTER_OUTPUT_DIR = project_path('Processed_Data/Dynamic_Spectrum')
 
 
 # 控制面板
-
 # 批量处理开关
 # True: 自动扫描 PIPELINE_RESULTS_DIR 下所有的 .ds 文件并批量出图
 # False: 仅处理下方指定的 SINGLE_DS_FILE
 BATCH_PROCESS = False
 
-# 如果关闭了批量处理，请在这里填入你要单独出图的那个 .ds 文件的相对位置
-SINGLE_DS_FILE = project_path('Pipeline_Results/GJ_4274/DS_Results/GJ_4274_SB80734_beam35.ds')
+# 如果关闭了批量处理 (设为False)，请在这里填入你要单独出图的那个 .ds 文件的相对/绝对位置
+SINGLE_DS_FILE = project_path('Pipeline_Results/2MASS_J01033563-5515561_A/DS_Results/2MASS_J01033563-5515561_A_SB84261_beam12.ds')
 
 
-def run_official_and_force_save(args, output_path):
+def run_official_and_force_save(args, output_prefix):
     print(f" 执行指令: {' '.join(args)}")
 
-    # 拦截官方脚本底层的 plt.show()，强制篡改为 plt.savefig()
+    # 拦截官方脚本底层的 plt.show()，并捕获所有生成的独立画板
     def patched_show(*a, **kw):
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f" 成功拦截内存图像并保存至: {os.path.basename(output_path)}\n")
+        fignums = plt.get_fignums()
+
+        if not fignums:
+            print(" ⚠️ 警告：官方指令未生成任何图像。")
+            return
+
+        print(f"👀 发现官方指令在内存中生成了 {len(fignums)} 张画板，正在自动匹配命名...")
+
+        # 按照官方出图的物理顺序进行精准命名（已去除 _official 后缀）
+        for i, fignum in enumerate(fignums):
+            plt.figure(fignum)  # 激活切换到对应的画板
+
+            if i == 0:
+                suffix = "_StokesI_Official.png"  # 第1张：Stokes I 动态谱
+            elif i == 1:
+                suffix = "_StokesV_Official.png"  # 第2张：Stokes V 动态谱
+            elif i == 2:
+                suffix = "_Lightcurve_Official.png"  # 第3张：光变曲线
+            else:
+                suffix = f"_ExtraPart{i + 1}.png"
+
+            current_out = output_prefix + suffix
+            plt.savefig(current_out, dpi=300, bbox_inches='tight')
+            print(f"✅ 成功提取并覆盖保存: {os.path.basename(current_out)}")
 
     original_show = plt.show
     plt.show = patched_show
@@ -60,7 +83,6 @@ def run_official_and_force_save(args, output_path):
         # 在当前 Python 进程中直接运行官方 CLI 脚本
         runpy.run_path(cli_path, run_name='__main__')
     except SystemExit as e:
-        # 官方脚本跑完通常会 sys.exit(0)，捕获它防止我们的外层脚本中断
         if e.code != 0 and e.code is not None:
             print(f" 官方指令异常退出，退出代码: {e.code}")
     except Exception as e:
@@ -72,7 +94,7 @@ def run_official_and_force_save(args, output_path):
 
 
 def process_ds_file(ds_file, output_dir):
-    """处理单个 .ds 文件并分发到专属画廊的逻辑封装"""
+    """处理单个 .ds 文件并生成 [动态谱 + 光变曲线] 综合图"""
     basename = os.path.basename(ds_file)
 
     # 提取源名、SBid和Beam
@@ -82,17 +104,15 @@ def process_ds_file(ds_file, output_dir):
         sbid = match.group(2)
         beam = match.group(3)
     else:
-        # 容错提取
         hostname = basename.replace('.ds', '')
         sb_match = re.search(r'SB(\d+)', basename, re.IGNORECASE)
         beam_match = re.search(r'beam(\d+)', basename, re.IGNORECASE)
         sbid = sb_match.group(1) if sb_match else "UNKNOWN"
         beam = beam_match.group(1) if beam_match else "UNKNOWN"
 
-    # 组合出规范的输出文件前缀 (包含源、SBid、Beam)
     base_name_str = f"{hostname}_SB{sbid}_beam{beam}"
 
-    # 在 Dynamic_Spectrum 下创建专属文件夹
+    # 在 Dynamic_Spectrum 下动态创建该恒星的专属文件夹
     source_specific_dir = os.path.join(output_dir, hostname)
     os.makedirs(source_specific_dir, exist_ok=True)
 
@@ -100,39 +120,30 @@ def process_ds_file(ds_file, output_dir):
     print(f"🎯 正在处理数据: {basename}")
     print(f"📂 图像将收纳至: {source_specific_dir}/")
 
-    # 任务 1: 单独生成 Stokes I 的动态谱 (加上 _official 后缀)
-    args_i = ["dstools-plot-ds", "-d", ds_file, "-s", "I", "-t", "3", "-f", "3"]
-    out_i = os.path.join(source_specific_dir, f"{base_name_str}_StokesI_official.png")
-    if not os.path.exists(out_i):
-        run_official_and_force_save(args_i, out_i)
-    else:
-        print(f" ⏭️ {os.path.basename(out_i)} 已存在，自动跳过。")
+    # 指令区 (带 -l 开关，直接生成并覆盖)
+    # [大图模式] Stokes I 和 V 的动态谱 + 它们的光变曲线
+    args_combined = [
+        "dstools-plot-ds", "-d", ds_file,
+        "-s", "IV", "-l",
+        "-t", "30", "-f", "3",
+        "-I", "2",  # 控制 Stokes I 的辐射通量范围上限
+        "-V", "2"  # 控制 Stokes V 的辐射通量范围上限
+    ]
+    # 名字（源_SBid_beam）：
+    out_prefix = os.path.join(source_specific_dir, base_name_str)
 
-    # 任务 2: 单独生成 Stokes V 的动态谱 (加上 _official 后缀)
-    args_v = ["dstools-plot-ds", "-d", ds_file, "-s", "V", "-t", "3", "-f", "3"]
-    out_v = os.path.join(source_specific_dir, f"{base_name_str}_StokesV_official.png")
-    if not os.path.exists(out_v):
-        run_official_and_force_save(args_v, out_v)
-    else:
-        print(f" ⏭️ {os.path.basename(out_v)} 已存在，自动跳过。")
-
-    # 任务 3: 生成包含光变曲线的综合图 (加上 _official 后缀)
-    args_lc = ["dstools-plot-ds", "-d", ds_file, "-s", "IV", "-l", "-t", "15", "-f", "15"]
-    out_lc = os.path.join(source_specific_dir, f"{base_name_str}_Lightcurve_official.png")
-    if not os.path.exists(out_lc):
-        run_official_and_force_save(args_lc, out_lc)
-    else:
-        print(f" ⏭️ {os.path.basename(out_lc)} 已存在，自动跳过。")
+    print("📊 开始渲染综合图 (Stokes I/V 动态谱 + 光变曲线)...")
+    run_official_and_force_save(args_combined, out_prefix)
 
 
 def main():
     print("======================================================")
-    print(" ASKAP 官方画图管线")
+    print(" 🎨 ASKAP 官方画图管线")
     print("======================================================")
 
     if BATCH_PROCESS:
         print("💡 当前模式：【全量批量出图】")
-        # 自动寻找所有的 .ds 成果文件
+        # 自动深层寻找所有的 .ds 成果文件
         ds_files = glob.glob(os.path.join(PIPELINE_RESULTS_DIR, '**', '*.ds'), recursive=True)
 
         if not ds_files:
@@ -141,18 +152,20 @@ def main():
 
         print(f"✅ 共发现 {len(ds_files)} 个 .ds 文件，准备出图！\n")
 
+        # 开始遍历并处理每一个 .ds 文件
         for ds_file in ds_files:
             process_ds_file(ds_file, MASTER_OUTPUT_DIR)
 
     else:
-        print(" 当前模式：【单ds文件出图】")
+        print("💡 当前模式：【单文件出图】")
         if not os.path.exists(SINGLE_DS_FILE):
-            print(f" ❌ 指定的ds文件不存在，请检查路径: \n{SINGLE_DS_FILE}")
+            print(f" ❌ 指定的单文件不存在，请检查路径: \n{SINGLE_DS_FILE}")
             return
+
         process_ds_file(SINGLE_DS_FILE, MASTER_OUTPUT_DIR)
 
-    print("\n" + "=" * 60 + f"\n🎉 图像生成并分发完毕！")
-    print(f"📁 请前往{MASTER_OUTPUT_DIR}查看 ")
+    print("\n" + "=" * 60 + f"\n🎉 图像生成完毕！")
+    print(f"📁 请前往 {MASTER_OUTPUT_DIR} 查看")
 
 
 if __name__ == "__main__":

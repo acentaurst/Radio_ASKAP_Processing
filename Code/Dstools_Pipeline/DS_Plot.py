@@ -25,13 +25,14 @@ MASTER_OUTPUT_DIR = project_path('Processed_Data/Dynamic_Spectrum')
 
 # 控制面板
 # 请在这里填入你要单独出图的那个 .ds 文件的相对/绝对位置
-SINGLE_DS_FILE = project_path('Pipeline_Results/GJ_4274/DS_Results/GJ_4274_SB36105_beam28.ds')
+SINGLE_DS_FILE = project_path('Pipeline_Results/2MASS_J01033563-5515561_A/DS_Results/2MASS_J01033563-5515561_A_SB68040_beam10.ds')
 
 # 统一设置绘图界限 (mJy)
-V_LIMIT = 18
+I_LIMIT = 6  # Stokes I 的色标上下限 (例如: +/- 30 mJy)
+V_LIMIT = 3.5  # Stokes V 的色标上下限 (例如: +/- 10 mJy)
 
 # 设置平均因子 (相当于官方指令的 -t 和 -f)
-T_AVG = 3  # 时间平均因子
+T_AVG = 20  # 时间平均因子
 F_AVG = 3  # 频率平均因子
 
 # 🎨 核心出图逻辑
@@ -75,13 +76,14 @@ def process_ds_file(ds_file, output_dir):
     # 任务 1: 渲染 Stokes I
     out_i = os.path.join(source_specific_dir, f"{base_name_str}_StokesI.png")
     print(" 正在渲染 Stokes I...")
-    fig_i, ax_i = plot_ds(ds, stokes='I', cmax=V_LIMIT, imag=False)
+    fig_i, ax_i = plot_ds(ds, stokes='I', cmax=I_LIMIT, imag=False)
 
     # 调整色标和范围
     if len(ax_i.images) > 0:
         im_i = ax_i.images[0]
         im_i.set_cmap('coolwarm')
-        im_i.set_clim(-V_LIMIT, V_LIMIT)
+        im_i.set_clim(-I_LIMIT, I_LIMIT)
+
     ax_i.set_title(f"ASKAP Dynamic Spectrum (SB{sbid}) - Stokes I", fontsize=14, pad=15)
     plt.savefig(out_i, dpi=300, bbox_inches='tight')
     plt.close(fig_i)
@@ -98,12 +100,10 @@ def process_ds_file(ds_file, output_dir):
         im_v.set_cmap('coolwarm')
         im_v.set_clim(-V_LIMIT, V_LIMIT)
 
-    #  标题去掉了 Range，加上了 SBid
     ax_v.set_title(f"ASKAP Dynamic Spectrum (SB{sbid}) - Stokes V", fontsize=14, pad=15)
     plt.savefig(out_v, dpi=300, bbox_inches='tight')
     plt.close(fig_v)
     print(f" Stokes V 已保存: {os.path.basename(out_v)}")
-
 
 def main():
     print("  ASKAP 单文件画图管线")

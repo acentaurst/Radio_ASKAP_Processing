@@ -13,6 +13,7 @@ import numpy as np
 import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import casacore.tables as pt
 
 warnings.filterwarnings('ignore')
@@ -48,12 +49,10 @@ CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downl
 PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Pipeline_Results"
 
 # --- 控制参数 ---
-TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','GJ 4274','AU Mic']
-
-# 掩模半径（角秒）
-MASK_RADIUS: int = 15
-WSCLEAN_THREADS: int = 36
-
+TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel','ROXs 42 B','TOI-2992']
+MASK_RADIUS: int = 15     # 掩模半径（角秒）
+MAX_CONCURRENT_MS: int = 5     # 同时并行处理的 MS 压缩包数量
+WSCLEAN_THREADS: int = 8     # 每个 WSClean 进程分配的线程数
 
 # --- 辅助函数 ---
 def extract_sbid_and_beam(filename: str) -> Tuple[Optional[str], Optional[str]]:
@@ -117,9 +116,7 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
         logger.info(f" [跳过] {final_ds_name} 已存在。")
         return
 
-    # ==========================================================================
     # 坐标计算逻辑
-    # ==========================================================================
     pmra_val = star_meta.get('sy_pmra', star_meta.get('pmra', 0.0))
     pmdec_val = star_meta.get('sy_pmdec', star_meta.get('pmdec', 0.0))
     pmra = 0.0 if pd.isna(pmra_val) else float(pmra_val)
@@ -211,23 +208,36 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
 def process_entire_source(clean_hostname: str, tar_files: List[str], star_meta: Dict[str, Any],
                           sbid_to_mjd: Dict[str, float]) -> str:
     logger.info(f"==========================================")
-    logger.info(f"处理源: {clean_hostname}，共 {len(tar_files)} 个包")
+    logger.info(f"处理源: {clean_hostname}，共 {len(tar_files)} 个包。当前启动 {MAX_CONCURRENT_MS} 个并发通道！")
     logger.info(f"==========================================")
-    for tar_path in tar_files:
+
+    # 包装单包运行逻辑，以便在多线程中捕获异常
+    def _run_single(tar_path):
         sbid, beam = extract_sbid_and_beam(os.path.basename(tar_path))
-        if not sbid or not beam: continue
+        if not sbid or not beam:
+            return
         if sbid not in sbid_to_mjd:
             logger.warning(f"无法在 01 表中找到 SBID {sbid} 的对应观测时间，跳过该ms数据文件。")
-            continue
+            return
         obs_mjd = sbid_to_mjd[sbid]
-        try:
-            process_single_tar(tar_path, clean_hostname, star_meta, sbid, beam, obs_mjd)
-        except KeyboardInterrupt:
-            logger.warning("接收到中断信号 (Ctrl+C)，退出。")
-            raise
-        except Exception as e:
-            logger.exception(f"  处理失败: {e}")
-            continue
+        process_single_tar(tar_path, clean_hostname, star_meta, sbid, beam, obs_mjd)
+
+    # 使用线程池执行并发
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_MS) as executor:
+        future_to_tar = {executor.submit(_run_single, tar_path): tar_path for tar_path in tar_files}
+
+        for future in as_completed(future_to_tar):
+            tar_path = future_to_tar[future]
+            try:
+                future.result()  # 阻塞等待单包处理完成
+            except KeyboardInterrupt:
+                logger.warning("接收到中断信号 (Ctrl+C)，退出。")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            except Exception as e:
+                logger.exception(f"  处理包 {os.path.basename(tar_path)} 失败: {e}")
+                continue
+
     return clean_hostname
 
 
