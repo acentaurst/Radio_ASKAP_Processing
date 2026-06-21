@@ -45,13 +45,13 @@ def project_path(relative_path: str) -> str:
 ASKAP_CATALOGUE_CSV: str = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
 INPUT_CSV: str = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_1.csv')
 
-CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data"
-PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Pipeline_Results"
+CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data"
+PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
 # --- 控制参数 ---
-TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel','ROXs 42 B','TOI-2992']
+TARGET_SOURCES: List[str] = ['AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','PZ Tel']
 MASK_RADIUS: int = 15     # 掩模半径（角秒）
-MAX_CONCURRENT_MS: int = 5     # 同时并行处理的 MS 压缩包数量
+MAX_CONCURRENT_MS: int = 7     # 同时并行处理的 MS 压缩包数量
 WSCLEAN_THREADS: int = 8     # 每个 WSClean 进程分配的线程数
 
 # --- 辅助函数 ---

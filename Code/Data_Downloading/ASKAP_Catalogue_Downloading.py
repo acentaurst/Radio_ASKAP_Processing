@@ -21,9 +21,9 @@ def project_path(relative_path):
 
 # 0.USER CONFIGURATION
 OPAL_USER = "acentauri_huangst@163.com"
-DOWNLOAD_DIR = project_path('Downloading_Data/ASKAP_Catalogue')
+DOWNLOAD_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/ASKAP_Catalogue'
 FAILED_CSV = os.path.join(DOWNLOAD_DIR, "failed_downloads.csv")
-START_FROM_NUMBER = 1  # 从第几个文件开始
+START_FROM_NUMBER = 7600  # 从第几个文件开始
 BATCH_SIZE = 3
 MAX_RETRY = 3  # staging / download 都最多试 3 次
 SLEEP_BETWEEN_RETRY = 5  # 秒
@@ -31,7 +31,7 @@ SLEEP_BETWEEN_RETRY = 5  # 秒
 # 1.LOGIN
 casda = Casda()
 try:
-    casda.login(username=OPAL_USER, store_password=True)
+    casda.login(username=OPAL_USER, store_password=False)
     print(f" Logged in as {OPAL_USER}")
 except Exception as e:
     print(f" Login failed: {e}")

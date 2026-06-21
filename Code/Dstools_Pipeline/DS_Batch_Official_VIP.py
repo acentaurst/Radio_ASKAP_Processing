@@ -44,18 +44,17 @@ def project_path(relative_path: str) -> str:
 
 ASKAP_CATALOGUE_CSV: str = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
 INPUT_CSV: str = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_1.csv')
-PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Pipeline_Results"
+PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
 
 #  VIP 控制面板
 # 在这里填入你想优先处理的高质量包的绝对路径
-VIP_TAR_FILES: List[str] = ['/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/2MASS_J01033563-5515561_A/59565_scienceData.EMU_0054-55.SB59565.EMU_0054-55.beam22_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/AB_Pic/51853_scienceData.EMU_0610-60.SB51853.EMU_0610-60.beam34_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/AB_Pic/61949_scienceData.EMU_0618-55.SB61949.EMU_0618-55.beam03_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/Proxima_Cen/77270_scienceData.EMU_1424-60.SB77270.EMU_1424-60.beam03_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/PZ_Tel/79074_scienceData.FLASH_153.SB79074.FLASH_153.beam14_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/2MASS_J01033563-5515561_A/66827_scienceData.WALLABY_0051-53A.SB66827.WALLABY_0051-53A.beam10_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/2MASS_J01033563-5515561_A/68040_scienceData.WALLABY_0051-53B.SB68040.WALLABY_0051-53B.beam10_averaged_cal.leakage.ms.tar'
+VIP_TAR_FILES: List[str] = ['/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/AB_Pic/51853_scienceData.EMU_0610-60.SB51853.EMU_0610-60.beam34_averaged_cal.leakage.ms.tar',
+                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/AB_Pic/61949_scienceData.EMU_0618-55.SB61949.EMU_0618-55.beam03_averaged_cal.leakage.ms.tar',
+                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/Proxima_Cen/77270_scienceData.EMU_1424-60.SB77270.EMU_1424-60.beam03_averaged_cal.leakage.ms.tar',
+                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/PZ_Tel/79074_scienceData.FLASH_153.SB79074.FLASH_153.beam14_averaged_cal.leakage.ms.tar',
+                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/2MASS_J01033563-5515561_A/66827_scienceData.WALLABY_0051-53A.SB66827.WALLABY_0051-53A.beam10_averaged_cal.leakage.ms.tar',
+                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/2MASS_J01033563-5515561_A/68040_scienceData.WALLABY_0051-53B.SB68040.WALLABY_0051-53B.beam10_averaged_cal.leakage.ms.tar'
     # 示例: '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/GJ_4274/scienceData.VAST...beam00.ms.tar',
 ]
 

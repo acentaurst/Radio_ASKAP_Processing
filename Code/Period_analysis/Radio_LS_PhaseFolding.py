@@ -15,14 +15,21 @@ from scipy.signal import find_peaks
 
 from dstools.dynamic_spectrum import DynamicSpectrum
 
-# 自适应路径定位
+# 自适应路径定位（优先从脚本位置向上找项目根，PyCharm中则用容器挂载目录）
+_PROJECT_MOUNT = "/home/dev/projects/ASKAP_Stellar_with_Exoplanet"
+
 def project_path(relative_path: str) -> str:
     current = os.path.abspath(os.path.dirname(__file__))
     while not (os.path.isdir(os.path.join(current, "Code")) and os.path.isdir(os.path.join(current, "Processed_Data"))):
         parent = os.path.dirname(current)
-        if parent == current: return os.path.join(os.getcwd(), relative_path)
+        if parent == current:
+            break
         current = parent
-    return os.path.join(current, relative_path)
+    else:
+        return os.path.join(current, relative_path)
+    if os.path.isdir(_PROJECT_MOUNT):
+        return os.path.join(_PROJECT_MOUNT, relative_path)
+    return os.path.join(os.getcwd(), relative_path)
 
 
 # ==========================================
@@ -34,8 +41,10 @@ TESS_PERIOD = 0.166  # TESS测定的恒星光学周期 (天)
 # 指定需要处理的 SBID 列表 (仅处理列表中的观测块)
 TARGET_SBIDS = ['68040']
 
-DS_FILES_PATTERN = project_path(f"Pipeline_Results/{SOURCE_NAME}/DS_Results/*.ds")
-MASTER_OUTPUT_DIR = project_path(f"Processed_Data/Period_Verification/{SOURCE_NAME}")
+# DS_FILES_PATTERN = project_path(f"Pipeline_Results/{SOURCE_NAME}/DS_Results/*.ds")  # 原服务器路径
+DS_FILES_PATTERN = f"/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Data/Ds/{SOURCE_NAME}/*.ds"
+# MASTER_OUTPUT_DIR = project_path(f"Processed_Data/Radio_Period_Verification/{SOURCE_NAME}")  # 原服务器路径
+MASTER_OUTPUT_DIR = f"/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Result/Period_Verification/{SOURCE_NAME}"
 os.makedirs(MASTER_OUTPUT_DIR, exist_ok=True)
 
 # Lomb-Scargle 周期搜索范围 (天)
@@ -192,9 +201,9 @@ def load_and_stitch_long_tracks():
     return all_mjd[valid], all_flux_i[valid], all_flux_v[valid], all_sbid_id[valid], sbid_map, beam_map
 
 
-# ==========================================
+# ==================================
 # 4. 主程序流程：周期分析与绘图
-# ==========================================
+# ==================================
 def main():
     mjd, flux_i, flux_v, all_sbid_id, sbid_map, beam_map = load_and_stitch_long_tracks()
 
@@ -208,21 +217,31 @@ def main():
         file_suffix = f"_Stitched_{len(unique_sbids)}obs"
 
     # --- Lomb-Scargle 周期图计算 ---
+    # 1. 计算 Stokes V
     flux_v_norm = robust_normalize(flux_v)
     ls_v = LombScargle(mjd, flux_v_norm)
     frequency, power_v = ls_v.autopower(minimum_frequency=1 / PERIOD_MAX, maximum_frequency=1 / PERIOD_MIN,
                                         samples_per_peak=15)
     periods = 1.0 / frequency
 
+    # 2. 计算 Stokes I
     flux_i_norm = robust_normalize(flux_i)
-    _, power_i = LombScargle(mjd, flux_i_norm).autopower(minimum_frequency=1 / PERIOD_MAX,
-                                                         maximum_frequency=1 / PERIOD_MIN, samples_per_peak=15)
+    ls_i = LombScargle(mjd, flux_i_norm)
+    _, power_i = ls_i.autopower(minimum_frequency=1 / PERIOD_MAX, maximum_frequency=1 / PERIOD_MIN, samples_per_peak=15)
 
-    # 计算窗函数 (Window Function) 以评估采样引入的频谱混叠
+    # 3. 计算窗函数 (Window Function)
     window_power = LombScargle(mjd, np.ones_like(mjd), fit_mean=False, center_data=False).power(frequency)
 
-    # 提取 Stokes V 功率谱的最高峰作为射电最佳周期
-    best_p_day = periods[np.argmax(power_v)]
+    # 分别提取 Stokes I 和 Stokes V 的最佳周期
+    best_p_v = periods[np.argmax(power_v)]
+    best_p_i = periods[np.argmax(power_i)]
+
+    print(f"\n[INFO] === 射电周期拟合结果 ===")
+    print(f"   TESS 周期: {TESS_PERIOD:.5f} d")
+    print(f"   TESS 半周期  : {TESS_PERIOD / 2.0:.5f} d")
+    print(f"   Stokes V (圆偏振) 最佳周期: {best_p_v:.5f} d")
+    print(f"   Stokes I (总流量) 最佳周期: {best_p_i:.5f} d")
+    print(f"=====================================\n")
 
     # ---------------------------------------------
     # 绘图 1：Lomb-Scargle 周期图
@@ -237,7 +256,7 @@ def main():
     ax2.set_ylim(0, max(1.1, np.max(window_power) * 1.2))
     ax2.tick_params(axis='y', labelcolor="gray", labelsize=8)
 
-    # 主Y轴：绘制数据功率谱 (置于顶层以防被遮挡)
+    # 主Y轴：绘制数据功率谱 (置于顶层)
     ax1.set_zorder(10)
     ax1.patch.set_visible(False)
 
@@ -248,7 +267,8 @@ def main():
     ax1.axvline(x=TESS_PERIOD, color="red", linestyle="-.", linewidth=1.8, label=f"TESS P = {TESS_PERIOD:.4f} d")
     ax1.axvline(x=TESS_PERIOD / 2.0, color="blue", linestyle=":", linewidth=1.5,
                 label=f"TESS Half-P = {TESS_PERIOD / 2.0:.4f} d")
-    ax1.axvline(x=best_p_day, color="green", linestyle="-", linewidth=1.2, label=f"Radio Peak = {best_p_day:.4f} d")
+    ax1.axvline(x=best_p_v, color="green", linestyle="-", linewidth=1.5, label=f"Stokes V Peak = {best_p_v:.4f} d")
+    ax1.axvline(x=best_p_i, color="purple", linestyle="--", linewidth=1.5, label=f"Stokes I Peak = {best_p_i:.4f} d")
 
     ax1.set_xlim(0.04, 0.5)
     ax1.set_xlabel("Period (Days)", fontweight='bold')
@@ -273,15 +293,27 @@ def main():
     # ---------------------------------------------
     # 绘图 2：相位折叠图 (Phase Folding)
     # ---------------------------------------------
-    # 分别使用 TESS真实周期、TESS半周期、射电最佳周期 进行折叠对比
-    fold_targets = [("TESS True Period", TESS_PERIOD), ("TESS Half-Period", TESS_PERIOD / 2.0),
-                    ("Radio Best Peak", best_p_day)]
+    # 将折叠目标增加为 4 个，分别验证 I 和 V 的拟合结果
+    fold_targets = [
+        ("TESS True Period", TESS_PERIOD),
+        ("TESS Half-Period", TESS_PERIOD / 2.0),
+        ("Stokes I Best Peak", best_p_i),
+        ("Stokes V Best Peak", best_p_v)
+    ]
+
+    # 图表高度自适应增加 (4.2 * 4 = 16.8)
     fig, axes = plt.subplots(len(fold_targets), 2, figsize=(14, 4.2 * len(fold_targets)), dpi=150)
 
     for row, (label, p_val) in enumerate(fold_targets):
         for col, (flux_data, name, col_color) in enumerate(
                 [(flux_i, "Stokes I", "steelblue"), (flux_v, "Stokes V", "darkorange")]):
             ax = axes[row, col]
+
+            # 如果算出的周期恰好是 0 (异常兜底)，则跳过折叠防止报错
+            if p_val <= 0:
+                ax.text(0.5, 0.5, "Invalid Period", ha='center', va='center')
+                continue
+
             phase = (mjd % p_val) / p_val
 
             # 绘制散点 (绘制两周期以观察连续性)

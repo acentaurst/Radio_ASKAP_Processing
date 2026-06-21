@@ -2,7 +2,7 @@ import os
 import glob
 
 # 填写管线结果主目录
-PIPELINE_RESULTS_BASE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Pipeline_Results"
+PIPELINE_RESULTS_BASE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
 
 def smart_clean_wsclean_models(results_dir):

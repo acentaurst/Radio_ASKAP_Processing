@@ -36,13 +36,12 @@ keyring.core.set_keyring(keyring.core.load_keyring('keyrings.cryptfile.cryptfile
 OPAL_USER = "acentauri_huangst@163.com"
 
 # 路径配置
-CASDA_BASE_PATH = project_path('Downloading_Data/ms_data')
-INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_1.csv')
+CASDA_BASE_PATH = '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data'
+INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
 FAILED_LIST_PATH = os.path.join(os.path.dirname(CASDA_BASE_PATH), '0.failed_ms_downloads_log.csv')
 
 # ————————————————— 核心控制参数 —————————————————
-TARGET_SOURCES = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel','ROXs 42 B','TOI-2992']
-
+TARGET_SOURCES = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 229','GJ 896 A','GJ 3323','GJ 4274','HD 180902','HD 41004 A','HD 95086','Proxima Cen','PZ Tel','ROXs 42 B','TOI-2992','TOI-2458']
 MAX_RETRIES = 3
 BATCH_SIZE = 15  # 每次最多向服务器请求的文件数量，避免 414 URI Too Long
 
@@ -153,11 +152,15 @@ def process_source(src):
                 safe_orig_name = best_filename.split('/')[-1]
                 expected_local_name = f"{sb_id_num}_{safe_orig_name}"
                 file_path = os.path.join(source_dir, expected_local_name)
-
-                is_complete = os.path.exists(file_path) and os.path.getsize(file_path) > 100 * 1024 * 1024
+                # 期望的 checksum 文件路径
+                checksum_path = f"{file_path}.checksum"
+                # 只有当主文件和其专属的 .checksum 文件同时存在时，才认为下载完整
+                is_complete = os.path.exists(file_path) and os.path.exists(checksum_path)
 
                 if not is_complete:
                     if os.path.exists(file_path): os.remove(file_path)
+                    # 为了干净，如果残存了旧的校验文件也顺手删掉
+                    if os.path.exists(checksum_path): os.remove(checksum_path)
                     files_to_download_indices.append(global_idx)
 
             if not files_to_download_indices:
@@ -196,13 +199,19 @@ def process_source(src):
                                     orig_basename = os.path.basename(downloaded_file)
                                     for idx in batch_indices:
                                         row = results[idx]
-                                        if orig_basename in row['filename']:
+                                        main_file_basename = os.path.basename(row['filename'])
+
+                                        # 如果下载的文件是主文件，或者主文件名加上 .checksum
+                                        if orig_basename == main_file_basename or orig_basename == f"{main_file_basename}.checksum":
                                             sb_id_num = row['obs_id'].replace('ASKAP-', '')
                                             final_path = os.path.join(source_dir, f"{sb_id_num}_{orig_basename}")
 
                                             if os.path.exists(final_path): os.remove(final_path)
                                             os.rename(downloaded_file, final_path)
-                                            downloaded_count += 1
+
+                                            # 只有在归类主文件时，才增加成功下载的计数
+                                            if orig_basename == main_file_basename:
+                                                downloaded_count += 1
                                             break
                                 batch_success = True
                                 break  # 批次下载成功，跳出局部重试

@@ -27,12 +27,12 @@ def project_path(relative_path):
 
 
 # --- 1. 配置文件路径 ---
-XML_DIR = project_path('Downloading_Data/ASKAP_Catalogue')
+XML_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/ASKAP_Catalogue'
 ASKAP_CATALOGUE_CSV = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
-FINAL_OUTPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_3.csv')
+FINAL_OUTPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
 
 # 你的原始恒星表
-STAR_CATALOG_CSV = project_path('Processed_Data/Catalogue/PS-Simbad.csv')
+STAR_CATALOG_CSV = project_path('Processed_Data/Catalogue/PS_2026.03.17_23.38.02.csv')
 
 PRECISION_THRESHOLD = 3.0  # 3角秒
 
@@ -75,10 +75,10 @@ def run_final_pipeline():
     # 剔除坐标为空的无效数据
     stars_df = stars_df.dropna(subset=['ra', 'dec']).reset_index(drop=True)
 
-    # pmra = stars_df['sy_pmra'].fillna(0.0).to_numpy(copy=True)
-    # pmdec = stars_df['sy_pmdec'].fillna(0.0).to_numpy(copy=True)
-    pmra = stars_df['pmra'].fillna(0.0).to_numpy(copy=True)
-    pmdec = stars_df['pmdec'].fillna(0.0).to_numpy(copy=True)
+    pmra = stars_df['sy_pmra'].fillna(0.0).to_numpy(copy=True)
+    pmdec = stars_df['sy_pmdec'].fillna(0.0).to_numpy(copy=True)
+    # pmra = stars_df['pmra'].fillna(0.0).to_numpy(copy=True)
+    # pmdec = stars_df['pmdec'].fillna(0.0).to_numpy(copy=True)
     plx = stars_df['sy_plx'].fillna(1.0).to_numpy(copy=True)
     plx[plx <= 0] = 1.0
 
