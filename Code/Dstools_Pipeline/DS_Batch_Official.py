@@ -9,12 +9,10 @@ import logging
 import warnings
 from typing import List, Dict, Tuple, Optional, Any
 import pandas as pd
-import numpy as np
 import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import casacore.tables as pt
 
 warnings.filterwarnings('ignore')
 
@@ -49,7 +47,7 @@ CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serve
 PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
 # --- 控制参数 ---
-TARGET_SOURCES: List[str] = ['AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','PZ Tel']
+TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel']
 MASK_RADIUS: int = 15     # 掩模半径（角秒）
 MAX_CONCURRENT_MS: int = 7     # 同时并行处理的 MS 压缩包数量
 WSCLEAN_THREADS: int = 8     # 每个 WSClean 进程分配的线程数
@@ -65,11 +63,13 @@ def extract_sbid_and_beam(filename: str) -> Tuple[Optional[str], Optional[str]]:
 
 def run_cmd(cmd_str: str, cwd: str) -> None:
     conda_bin_dir = os.path.dirname(sys.executable)
+    conda_lib_dir = os.path.join(os.path.dirname(conda_bin_dir), "lib")
     custom_env = os.environ.copy()
     custom_env["PATH"] = conda_bin_dir + os.pathsep + custom_env.get("PATH", "")
+    custom_env["LD_LIBRARY_PATH"] = conda_lib_dir + os.pathsep + custom_env.get("LD_LIBRARY_PATH", "")
+    cmd_str = f"env LD_LIBRARY_PATH={custom_env['LD_LIBRARY_PATH']} {cmd_str}"
 
     try:
-        # 使用 shell=True 以兼容 C++ 底层库文件流处理
         subprocess.run(cmd_str, shell=True, check=True, cwd=cwd, executable='/bin/bash', env=custom_env)
     except subprocess.CalledProcessError as e:
         logger.error(f"命令执行失败: {cmd_str}")
@@ -141,7 +141,7 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
     logger.info(
         f"坐标计算 J2015.5 -> {obs_time.datetime.date()}: RA {corr_ra}, DEC {corr_dec}")
 
-    existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-image.fits"))
+    existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-*"))
     wsclean_done = os.path.exists(wsclean_sentinel) and len(existing_mfs_images) > 0
 
     if not wsclean_done:
@@ -152,10 +152,10 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
 
         with tarfile.open(tar_path, 'r') as tar:
             tar.extractall(path=workspace_dir)
-
-        t = pt.table(os.path.join(workspace_dir, extracted_folder_name))
-        t.copy(os.path.join(workspace_dir, clean_ms_name), deep=True, valuecopy=True)
-        t.close()
+        os.rename(
+            os.path.join(workspace_dir, extracted_folder_name),
+            os.path.join(workspace_dir, clean_ms_name)
+        )
 
         logger.info("执行预处理 (dstools-askap-preprocess)...")
         run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
@@ -180,7 +180,7 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
     subtraction_done = os.path.exists(subtracted_ms_path) and os.path.exists(subtraction_sentinel)
 
     if not subtraction_done:
-        logger.info(f"--> [STEP 3] 插入模型 (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
+        logger.info(f"--> [STEP 3] 插入模型并写入 MODEL_DATA (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
         run_cmd(
             f"dstools-insert-model -p {corr_ra} {corr_dec} -r {MASK_RADIUS} {wsclean_model_dir_name} {clean_ms_name}",
             cwd=workspace_dir)

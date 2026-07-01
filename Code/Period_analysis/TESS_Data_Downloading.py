@@ -3,14 +3,17 @@ import re
 import glob
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import numpy as np
+import pandas as pd
+from astropy.coordinates import SkyCoord
 import lightkurve as lk
 from tqdm.auto import tqdm
 
 # ========================
 # 配置：修改这里的默认值
 # ========================
-DEFAULT_TARGETS = ["2MASS J01033563-5515561"]
+DEFAULT_TARGETS = ["GJ 4274","COCONUTS-2 A","GJ 896 A","HD 95086"]
 DEFAULT_DOWNLOAD_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data"
 DEFAULT_TYPE = "all"
 
@@ -19,6 +22,17 @@ SUFFIX_MAP = {
     "lc": "_lc.fits",
     "hlsp": "_hlsp.fits",
 }
+
+
+def project_path(relative_path):
+    current = os.path.abspath(os.path.dirname(__file__))
+    while not (os.path.isdir(os.path.join(current, 'Code')) and
+               os.path.isdir(os.path.join(current, 'Processed_Data'))):
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return os.path.join(current, relative_path)
 
 
 def sanitize_name(name):
@@ -58,8 +72,55 @@ def parse_sector(obs_id):
         return 0
 
 
+def parse_obs_time(obs_id):
+    """从 TESS obs_id 提取观测日期，返回可排序的整数（YYYYDDDHHMMSS）。
+    格式: tessYYYYDDDHHMMSS-...  例如 tess2018234235059-s0002"""
+    m = re.search(r"tess(\d{12})", obs_id)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"s(\d{4})", obs_id)  # fallback: sector number
+    if m:
+        return int(m.group(1)) * 1000000
+    return 0
+
+
 def resolve_tic_id(target_name):
-    """将目标名解析为 TIC ID，用于过滤锥形搜索中的邻近星数据"""
+    """用 CSV 目录中的坐标查 TIC ID，失败则走名字搜索 fallback。
+    返回 (tic_id, matched_name, ra, dec)"""
+
+    matched_name = target_name
+    ra_csv = None
+    dec_csv = None
+
+    # Step 1: 从交叉证认目录取坐标 → 用坐标 cone search TIC 星表
+    try:
+        csv_path = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
+        df = pd.read_csv(csv_path)
+        hostnames = df['hostname'].str.strip()
+
+        # 精确匹配
+        match = df[hostnames == target_name.strip()]
+        # 模糊匹配：hostname 包含 target_name
+        if len(match) == 0:
+            match = df[hostnames.str.contains(re.escape(target_name.strip()), na=False)]
+        if len(match) > 0:
+            matched_name = match.iloc[0]['hostname'].strip()
+            ra_csv = match.iloc[0]['ra']
+            dec_csv = match.iloc[0]['dec']
+
+            from astroquery.mast import Catalogs
+            coord = SkyCoord(ra=ra_csv, dec=dec_csv, unit="deg")
+            catalog = Catalogs.query_region(coord, catalog="TIC", radius=0.0014)
+            if catalog and len(catalog) > 0:
+                row = catalog[0]
+                for key in ("ID", "tic", "TIC", "TIC_ID"):
+                    val = row.get(key)
+                    if val is not None:
+                        return str(int(val)), matched_name, ra_csv, dec_csv
+    except Exception:
+        pass
+
+    # Step 2: 名字查询 fallback
     try:
         from astroquery.mast import Catalogs
         catalog = Catalogs.query_object(target_name, catalog="TIC", radius=0.0003)
@@ -68,19 +129,21 @@ def resolve_tic_id(target_name):
             for key in ("ID", "tic", "TIC", "TIC_ID"):
                 val = row.get(key)
                 if val is not None:
-                    return str(int(val))
+                    return str(int(val)), matched_name, ra_csv, dec_csv
     except Exception:
         pass
-    # 备选：从 lightkurve 搜索结果中提取
+
+    # Step 3: lightkurve 搜索 fallback
     try:
         sr = lk.search_targetpixelfile(target_name, mission="TESS")
         if len(sr) > 0:
             m = re.search(r"(\d{16})", str(sr.table["obs_id"][0]))
             if m:
-                return str(int(m.group(1)))
+                return str(int(m.group(1))), matched_name, ra_csv, dec_csv
     except Exception:
         pass
-    return None
+
+    return None, matched_name, ra_csv, dec_csv
 
 
 def filter_search_results(results, tic_id_str):
@@ -141,19 +204,30 @@ def _list_fits_files(directory):
     return set(glob.glob(os.path.join(directory, "**", "*.fits"), recursive=True))
 
 
-def download_one(row, download_dir, max_retries=3):
+def download_one(row, download_dir, max_retries=3, timeout=300):
     obs_id = row.table["obs_id"][0]
 
     for attempt in range(1, max_retries + 1):
         before = _list_fits_files(download_dir)
         try:
-            row.download(download_dir=download_dir)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(row.download, download_dir=download_dir)
+                future.result(timeout=timeout)
             return True, obs_id, None
+        except FutureTimeout:
+            after = _list_fits_files(download_dir)
+            new_files = after - before
+            if new_files:
+                return True, obs_id, None
+            print(f"      {obs_id} 下载超时 ({timeout}s)，尝试 {attempt}/{max_retries}")
+            if attempt < max_retries:
+                time.sleep(2 ** attempt)
+            else:
+                return False, obs_id, f"超时 ({timeout}s)"
         except Exception as e:
             after = _list_fits_files(download_dir)
             new_files = after - before
             if new_files:
-                # 文件已落地但 lightkurve 验证失败（常见于部分 HLSP）
                 return True, obs_id, None
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
@@ -163,35 +237,40 @@ def download_one(row, download_dir, max_retries=3):
     return False, obs_id, "unknown"
 
 
-def search_data(target_name, data_type):
-    """根据类型检索 MAST：tpf / lc / hlsp / both / all"""
+def search_data(target, data_type):
+    """根据类型检索 MAST：tpf / lc / hlsp / both / all。
+    target 可以是名字字符串或 SkyCoord 对象。"""
     results = {}
     if data_type in ("tpf", "both", "all"):
-        results["tpf"] = lk.search_targetpixelfile(target_name, mission="TESS")
+        results["tpf"] = lk.search_targetpixelfile(target, mission="TESS")
     if data_type in ("lc", "both", "all"):
-        results["lc"] = lk.search_lightcurve(target_name, mission="TESS")
+        results["lc"] = lk.search_lightcurve(target, mission="TESS")
     if data_type in ("hlsp", "all"):
         try:
-            results["hlsp"] = lk.search_lightcurve(target_name, mission="TESS", author=None)
+            results["hlsp"] = lk.search_lightcurve(target, mission="TESS", author=None)
         except TypeError:
-            # 部分版本的 lightkurve 不支持 author 参数
-            results["hlsp"] = lk.search_lightcurve(target_name, mission="TESS")
+            results["hlsp"] = lk.search_lightcurve(target, mission="TESS")
     return results
 
 
 def process_target(target_name, base_dir, organize_by_sector, data_type, clean=False):
-    target_dir = os.path.join(base_dir, sanitize_name(target_name))
     total_succeeded = 0
     total_obs = 0
     all_failed = []
 
-    # 0. 解析 TIC ID
-    tic_id = resolve_tic_id(target_name)
+    # 0. 解析 TIC ID（返回 CSV 中匹配到的名字，用于目录命名）
+    tic_id, matched_name, _, _ = resolve_tic_id(target_name)
+    target_dir = os.path.join(base_dir, sanitize_name(matched_name))
     if tic_id:
         print(f"\n{'='*60}")
-        print(f"目标: {target_name}  ->  TIC {tic_id}")
+        if matched_name != target_name:
+            print(f"目标: {target_name}  ->  {matched_name}  ->  TIC {tic_id}")
+        else:
+            print(f"目标: {target_name}  ->  TIC {tic_id}")
+        search_target = f"TIC {tic_id}"
     else:
         print(f"目标: {target_name}  (无法解析 TIC ID)")
+        search_target = target_name
 
     # 0b. 清理旧的错误文件
     if clean and tic_id:
@@ -202,8 +281,8 @@ def process_target(target_name, base_dir, organize_by_sector, data_type, clean=F
             print(f"  无需清理")
 
     # 1. 检索
-    print(f"\n正在 MAST 中检索: {target_name} (类型: {data_type}) ...")
-    search_results = search_data(target_name, data_type)
+    print(f"\n正在 MAST 中检索: {search_target} (类型: {data_type}) ...")
+    search_results = search_data(search_target, data_type)
 
     total_raw = sum(len(r) for r in search_results.values())
     for dtype, result in search_results.items():
@@ -255,8 +334,13 @@ def process_target(target_name, base_dir, organize_by_sector, data_type, clean=F
         print(f"[{target_name}] 所有数据均已下载。")
         return 0, 0, []
 
+    # 3b. 只下载最近的 20 组（按 Sector 降序，低于 20 组则全下载）
+    MAX_DOWNLOAD = 20
+    to_download.sort(key=lambda x: parse_obs_time(x[0].table["obs_id"][0]), reverse=True)
+    to_download = to_download[:MAX_DOWNLOAD]
+    print(f"[{target_name}] 下载最新 {len(to_download)} 组...")
+
     # 4. 下载
-    print(f"[{target_name}] 缺失 {len(to_download)} 组，开始下载...")
     total_obs = len(to_download)
 
     for row, dtype in tqdm(to_download, desc=f"下载 {target_name}", unit="组"):

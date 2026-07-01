@@ -9,13 +9,10 @@ import logging
 import warnings
 from typing import List, Dict, Tuple, Optional, Any
 import pandas as pd
-import numpy as np
 import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import casacore.tables as pt
-
 warnings.filterwarnings('ignore')
 
 # --- 独立的 "VIP" 日志配置 (防止与主程序写冲突) ---
@@ -49,18 +46,13 @@ PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet
 
 #  VIP 控制面板
 # 在这里填入你想优先处理的高质量包的绝对路径
-VIP_TAR_FILES: List[str] = ['/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/AB_Pic/51853_scienceData.EMU_0610-60.SB51853.EMU_0610-60.beam34_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/AB_Pic/61949_scienceData.EMU_0618-55.SB61949.EMU_0618-55.beam03_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/Proxima_Cen/77270_scienceData.EMU_1424-60.SB77270.EMU_1424-60.beam03_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/PZ_Tel/79074_scienceData.FLASH_153.SB79074.FLASH_153.beam14_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/2MASS_J01033563-5515561_A/66827_scienceData.WALLABY_0051-53A.SB66827.WALLABY_0051-53A.beam10_averaged_cal.leakage.ms.tar',
-                            '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/2MASS_J01033563-5515561_A/68040_scienceData.WALLABY_0051-53B.SB68040.WALLABY_0051-53B.beam10_averaged_cal.leakage.ms.tar'
+VIP_TAR_FILES: List[str] = ['/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/Proxima_Cen/50381_scienceData.VAST_1453-62.SB50381.VAST_1453-62.beam33_averaged_cal.leakage.ms.tar'
     # 示例: '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/GJ_4274/scienceData.VAST...beam00.ms.tar',
 ]
 
 MASK_RADIUS: int = 15  # 掩模半径（角秒）
 MAX_CONCURRENT_MS: int = 1  # VIP 通道的并发数量
-WSCLEAN_THREADS: int = 10  # VIP 专属分配的核心数 (注意不要和主程序加起来超过服务器总核)
+WSCLEAN_THREADS: int = 60  # VIP 专属分配的核心数
 
 
 # --- 辅助函数 ---
@@ -74,8 +66,12 @@ def extract_sbid_and_beam(filename: str) -> Tuple[Optional[str], Optional[str]]:
 
 def run_cmd(cmd_str: str, cwd: str) -> None:
     conda_bin_dir = os.path.dirname(sys.executable)
+    conda_lib_dir = os.path.join(os.path.dirname(conda_bin_dir), "lib")
     custom_env = os.environ.copy()
     custom_env["PATH"] = conda_bin_dir + os.pathsep + custom_env.get("PATH", "")
+    custom_env["LD_LIBRARY_PATH"] = conda_lib_dir + os.pathsep + custom_env.get("LD_LIBRARY_PATH", "")
+    # 用 env 前缀启动实际命令，避免 bash 自身加载 conda 库
+    cmd_str = f"env LD_LIBRARY_PATH={custom_env['LD_LIBRARY_PATH']} {cmd_str}"
     try:
         subprocess.run(cmd_str, shell=True, check=True, cwd=cwd, executable='/bin/bash', env=custom_env)
     except subprocess.CalledProcessError as e:
@@ -86,6 +82,7 @@ def run_cmd(cmd_str: str, cwd: str) -> None:
 # --- 核心数据处理逻辑 (与主程序完全一致) ---
 def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, Any], sbid: str, beam: str,
                        obs_mjd: float) -> None:
+    tag = f"[SB{sbid}-Bm{beam}]"
     tar_filename = os.path.basename(tar_path)
     star_results_dir = os.path.join(PIPELINE_RESULTS_BASE, clean_hostname)
     os.makedirs(star_results_dir, exist_ok=True)
@@ -133,7 +130,7 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
     corr_ra, corr_dec = round(star_at_obs.ra.deg, 7), round(star_at_obs.dec.deg, 7)
     logger.info(f"坐标推演 J2015.5 -> {obs_time.datetime.date()}: RA {corr_ra}, DEC {corr_dec}")
 
-    existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-image.fits"))
+    existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-*"))
     wsclean_done = os.path.exists(wsclean_sentinel) and len(existing_mfs_images) > 0
 
     if not wsclean_done:
@@ -143,9 +140,10 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
 
         with tarfile.open(tar_path, 'r') as tar:
             tar.extractall(path=workspace_dir)
-        t = pt.table(os.path.join(workspace_dir, extracted_folder_name))
-        t.copy(os.path.join(workspace_dir, clean_ms_name), deep=True, valuecopy=True)
-        t.close()
+        os.rename(
+            os.path.join(workspace_dir, extracted_folder_name),
+            os.path.join(workspace_dir, clean_ms_name)
+        )
 
         logger.info("执行预处理 (dstools-askap-preprocess)...")
         run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
@@ -169,10 +167,11 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
     subtraction_done = os.path.exists(subtracted_ms_path) and os.path.exists(subtraction_sentinel)
 
     if not subtraction_done:
-        logger.info(f"--> [STEP 3] 插入模型 (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
+        logger.info(f"--> [STEP 3] 插入模型并写入 MODEL_DATA (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
         run_cmd(
             f"dstools-insert-model -p {corr_ra} {corr_dec} -r {MASK_RADIUS} {wsclean_model_dir_name} {clean_ms_name}",
             cwd=workspace_dir)
+
         logger.info(f"--> [STEP 4] 执行背景减除 (dstools-subtract-model)...")
         run_cmd(f"dstools-subtract-model -S {clean_ms_name}", cwd=workspace_dir)
         with open(subtraction_sentinel, 'w', encoding='utf-8') as f:

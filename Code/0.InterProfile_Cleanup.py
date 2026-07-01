@@ -1,5 +1,6 @@
 import os
 import glob
+import shutil
 
 # 填写管线结果主目录
 PIPELINE_RESULTS_BASE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
@@ -27,17 +28,18 @@ def smart_clean_wsclean_models(results_dir):
 
         # 2. 状态判定：若无 .ds 成果，说明未跑完，直接跳过保护断点
         if not os.path.exists(ds_path):
-            print(f"⏸️  [跳过保护] {ws_name} (.ds 未生成)")
+            print(f"⏸️  [跳过保护] {ws_name} (.ds 未生成，保护工作区现场)")
             continue
 
-        print(f"🟢 [安全清理] {ws_name} (成果已存在，清理冗余 FITS)")
+        print(f"\n🟢 [安全清理] {ws_name} (成果已存在，开始清理冗余文件)")
 
-        # 3. 执行清理：仅删除 wsclean_model 下非 MFS 的 fits 文件
+        # 3. 执行清理一：仅删除 wsclean_model 下非 MFS 的 fits 文件
         model_dirs = glob.glob(os.path.join(ws, "wsclean_model*"))
         for model_dir in model_dirs:
             for file_path in glob.glob(os.path.join(model_dir, "*.fits")):
                 filename = os.path.basename(file_path)
 
+                # 核心保护逻辑：如果文件名里有 MFS，坚决不删！
                 if "MFS" not in filename:
                     try:
                         file_size = os.path.getsize(file_path)
@@ -47,12 +49,29 @@ def smart_clean_wsclean_models(results_dir):
                     except Exception:
                         pass
 
-                        # 4. 统计与输出
+        # 4. 执行清理二：连同庞大的 .ms 数据集一起粉碎（释放海量空间）
+        ms_dirs = glob.glob(os.path.join(ws, "*.ms"))
+        for ms_dir in ms_dirs:
+            try:
+                # 遍历计算 .ms 文件夹大小，用于最终的炫酷统计
+                for dirpath, _, filenames in os.walk(ms_dir):
+                    for f in filenames:
+                        fp = os.path.join(dirpath, f)
+                        if not os.path.islink(fp):
+                            total_size_freed += os.path.getsize(fp)
+
+                # 彻底删除 .ms 文件夹
+                shutil.rmtree(ms_dir)
+                print(f"    🗑️ 连带粉碎庞大数据集: {os.path.basename(ms_dir)}")
+            except Exception as e:
+                print(f"    ⚠️ 无法删除 {ms_dir}: {e}")
+
+    # 5. 统计与输出
     freed_gb = total_size_freed / (1024 ** 3)
     print("\n" + "=" * 50)
-    print(f"✅ 清理完成！")
+    print(f"✅ 深度清理完成！")
     print(f"💣 删除分通道 FITS 文件: {total_deleted_files} 个")
-    print(f"🚀 释放存储空间: {freed_gb:.2f} GB")
+    print(f"🚀 总计释放存储空间: {freed_gb:.2f} GB")
     print("=" * 50)
 
 

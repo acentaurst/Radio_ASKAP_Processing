@@ -21,10 +21,10 @@ def project_path(relative_path: str) -> str:
 
 
 # 管线产生 .ds 成果的目录
-PIPELINE_RESULTS_DIR = project_path('Pipeline_Results/2MASS_J01033563-5515561_A/DS_Results')
+PIPELINE_RESULTS_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/HD_180902'
 
-# 图像输出的全局根目录 (按源建立专属画廊)
-MASTER_OUTPUT_DIR = project_path('Processed_Data/Dynamic_Spectrum')
+# 图像输出的全局根目录 (按源建立“画廊”)
+MASTER_OUTPUT_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/Dynamic_Spectrum'
 
 
 # 控制面板
@@ -34,7 +34,13 @@ MASTER_OUTPUT_DIR = project_path('Processed_Data/Dynamic_Spectrum')
 BATCH_PROCESS = False
 
 # 如果关闭了批量处理 (设为False)，请在这里填入你要单独出图的那个 .ds 文件的相对/绝对位置
-SINGLE_DS_FILE = project_path('Pipeline_Results/2MASS_J01033563-5515561_A/DS_Results/2MASS_J01033563-5515561_A_SB84261_beam12.ds')
+SINGLE_DS_FILE = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/HD_180902/HD_180902_SB51766_beam32.ds'
+
+# 绘图参数
+T_AVG = 48    # 时间平均因子
+F_AVG = 5    # 频率平均因子
+I_LIMIT = 5  # Stokes I 辐射通量范围上限 (mJy)
+V_LIMIT = 5  # Stokes V 辐射通量范围上限 (mJy)
 
 
 def run_official_and_force_save(args, output_prefix):
@@ -72,6 +78,12 @@ def run_official_and_force_save(args, output_prefix):
 
     # 获取环境变量中官方指令的真实路径
     cli_path = shutil.which("dstools-plot-ds")
+    if not cli_path:
+        # 兼容 conda 环境未激活时的 Docker 环境
+        bin_dir = os.path.dirname(sys.executable)
+        candidate = os.path.join(bin_dir, "dstools-plot-ds")
+        if os.path.isfile(candidate):
+            cli_path = candidate
     if not cli_path:
         print(" 找不到 dstools-plot-ds 指令，请确认 conda 环境已激活。")
         return
@@ -125,9 +137,8 @@ def process_ds_file(ds_file, output_dir):
     args_combined = [
         "dstools-plot-ds", "-d", ds_file,
         "-s", "IV", "-l",
-        "-t", "30", "-f", "3",
-        "-I", "2",  # 控制 Stokes I 的辐射通量范围上限
-        "-V", "2"  # 控制 Stokes V 的辐射通量范围上限
+        "-t", str(T_AVG), "-f", str(F_AVG),
+        "-I", str(I_LIMIT), "-V", str(V_LIMIT)
     ]
     # 名字（源_SBid_beam）：
     out_prefix = os.path.join(source_specific_dir, base_name_str)

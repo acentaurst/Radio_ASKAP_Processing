@@ -14,24 +14,25 @@ from dstools.dynamic_spectrum import DynamicSpectrum
 # ==========================================
 # 1. 手动配置区
 # ==========================================
-PERIOD = 0.166  # 折叠周期 (天)
+PERIOD = 0.0224  # 折叠周期 (天)
 
 # DS 文件路径
-DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/2MASS_J01033563-5515561_A/2MASS_J01033563-5515561_A_SB68040_beam10.ds"
+DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/HD_95086/HD_95086_SB54805_beam24.ds"
 
 # TESS FITS 文件路径 (手动选择)
-TESS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data/2MASS_J01033563-5515561/Sector_00/mastDownload/HLSP/hlsp_tess-spoc_tess_phot_0000000206502540-s0069_tess_v1_tp/hlsp_tess-spoc_tess_phot_0000000206502540-s0069_tess_v1_tp.fits"
+TESS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data/HD_95086/Sector_65/mastDownload/TESS/tess2023124020739-s0065-0000000399637637-0259-s/tess2023124020739-s0065-0000000399637637-0259-s_tp.fits"
 
-# 输出目录
-OUTPUT_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/Combined/2MASS_J01033563-5515561_A"
+# 输出根目录（会自动按源名/SBID 分类）
+OUTPUT_BASE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/TESS_Radio_PeriodPlot_Combined"
 
 # 动态谱色标范围 (mJy)
-I_LIMIT = 6.0
-V_LIMIT = 3.5
+I_LIMIT = 5
+V_LIMIT = 5
 
 # 时间/频率平均因子
-T_AVG = 15    # 时间平均因子
-F_AVG = 3     # 频率平均因子
+T_AVG_LC = 48    # 光变曲线时间平均
+T_AVG_DS = 24   # 动态谱时间平均
+F_AVG = 5       # 频率平均因子
 
 # 调色板
 COLOR_TESS = "#4a8fd4"
@@ -62,6 +63,13 @@ if not sbid_match:
     sys.exit(1)
 target_sbid = sbid_match.group(1)
 print(f"Target SBID: {target_sbid}")
+
+ds_basename = os.path.basename(DS_FILE)
+source_match = re.search(r'(.+?)_SB\d+', ds_basename)
+source_name = source_match.group(1) if source_match else os.path.splitext(ds_basename)[0]
+OUTPUT_DIR = os.path.join(OUTPUT_BASE, source_name)
+print(f"Source: {source_name}")
+print(f"Output: {OUTPUT_DIR}")
 
 catalogue_path = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
 df_cat = pd.read_csv(catalogue_path)
@@ -94,34 +102,43 @@ tess_flux = lc_norm.flux.value
 tess_mjd = tess_btjd + 2457000 - 2400000.5
 print(f"  TESS data: {len(tess_btjd)} points, MJD range [{tess_mjd[0]:.4f}, {tess_mjd[-1]:.4f}]")
 
-# ==========================================
-# 5. 加载 DS 数据
-# ==========================================
-print(f"\nLoading DS: {os.path.basename(DS_FILE)}")
-ds = DynamicSpectrum(DS_FILE, tavg=T_AVG, favg=F_AVG, trim=True)
-t_hours = ds.time
-freqs = ds.freq
+period_hours = PERIOD * 24.0
 
-stokes_i_2d = np.real(ds.data.get("I"))
-stokes_v_2d = np.real(ds.data.get("V"))
+# ==========================================
+# 5. 加载 DS 数据（光变曲线用 T_AVG_LC，动态谱用 T_AVG_DS）
+# ==========================================
+print(f"\nLoading DS (LC, tavg={T_AVG_LC}): {os.path.basename(DS_FILE)}")
+ds_lc = DynamicSpectrum(DS_FILE, tavg=T_AVG_LC, favg=F_AVG, trim=True)
+t_hours = ds_lc.time
 
-flux_i = np.nanmean(stokes_i_2d, axis=1)
-flux_v = np.nanmean(stokes_v_2d, axis=1)
+stokes_i_2d_lc = np.real(ds_lc.data.get("I"))
+stokes_v_2d_lc = np.real(ds_lc.data.get("V"))
+
+flux_i = np.nanmean(stokes_i_2d_lc, axis=1)
+flux_v = np.nanmean(stokes_v_2d_lc, axis=1)
 flux_i_detrend = flux_i - np.nanmedian(flux_i)
 flux_v_detrend = flux_v - np.nanmedian(flux_v)
 
-flux_i_err = np.nanstd(stokes_i_2d, axis=1) / np.sqrt(len(freqs))
-flux_v_err = np.nanstd(stokes_v_2d, axis=1) / np.sqrt(len(freqs))
+flux_i_err = np.nanstd(stokes_i_2d_lc, axis=1) / np.sqrt(len(ds_lc.freq))
+flux_v_err = np.nanstd(stokes_v_2d_lc, axis=1) / np.sqrt(len(ds_lc.freq))
+
+print(f"  LC: {len(t_hours)} time samples")
+
+print(f"Loading DS (heatmap, tavg={T_AVG_DS})")
+ds_map = DynamicSpectrum(DS_FILE, tavg=T_AVG_DS, favg=F_AVG, trim=True)
+freqs = ds_map.freq
+stokes_i_2d = np.real(ds_map.data.get("I"))
+stokes_v_2d = np.real(ds_map.data.get("V"))
+t_phase = ds_map.time / period_hours  # 动态谱的相位轴
 
 ds_duration = t_hours[-1] - t_hours[0]
-print(f"  DS: {len(t_hours)} time samples, {len(freqs)} freq channels")
+print(f"  DS: {len(ds_map.time)} time samples, {len(freqs)} freq channels")
 print(f"  DS time: tmin={t_hours[0]:.2f}h, tmax={t_hours[-1]:.2f}h, duration={ds_duration:.2f}h")
 print(f"  Freq: {freqs[0]:.1f} - {freqs[-1]:.1f} MHz")
 
 # ==========================================
 # 6. 相位计算
 # ==========================================
-period_hours = PERIOD * 24.0
 n_phases = ds_duration / period_hours
 display_max = n_phases  # DS 数据覆盖多少相位就显示多少
 n_tiles = int(np.ceil(display_max))  # TESS 平铺仍需取整
@@ -226,7 +243,7 @@ ax2.tick_params(labelsize=10, colors="#555555")
 
 # --- Panel 3: Stokes I Dynamic Spectrum ---
 ax3 = fig.add_subplot(gs[2, 0])
-im_i = ax3.pcolormesh(phase_askap, freqs, stokes_i_2d.T,
+im_i = ax3.pcolormesh(t_phase, freqs, stokes_i_2d.T,
                        cmap="coolwarm", shading="auto", rasterized=True)
 im_i.set_clim(-I_LIMIT, I_LIMIT)
 ax3.set_xlim(0, display_max)
@@ -243,7 +260,7 @@ ax3.tick_params(labelsize=10, colors="#555555")
 
 # --- Panel 4: Stokes V Dynamic Spectrum ---
 ax4 = fig.add_subplot(gs[3, 0])
-im_v = ax4.pcolormesh(phase_askap, freqs, stokes_v_2d.T,
+im_v = ax4.pcolormesh(t_phase, freqs, stokes_v_2d.T,
                        cmap="coolwarm", shading="auto", rasterized=True)
 im_v.set_clim(-V_LIMIT, V_LIMIT)
 ax4.set_xlim(0, display_max)

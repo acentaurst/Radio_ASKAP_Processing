@@ -9,12 +9,10 @@ import logging
 import warnings
 from typing import List, Dict, Tuple, Optional, Any
 import pandas as pd
-import numpy as np
 import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import casacore.tables as pt
 
 warnings.filterwarnings('ignore')
 
@@ -45,18 +43,16 @@ def project_path(relative_path: str) -> str:
 ASKAP_CATALOGUE_CSV: str = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
 INPUT_CSV: str = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_1.csv')
 
-CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data"
-PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Pipeline_Results"
+CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data"
+PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
 # --- 控制参数 ---
-TARGET_SOURCES: List[str] = ['GJ 896 A','GJ 4274','COCONUTS-2 A']
+BATCH_PROCESS = False  # True: 批量处理 TARGET_SOURCES / False: 处理 SINGLE_TAR_FILE
+SINGLE_TAR_FILE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/Proxima_Cen/50381_scienceData.VAST_1453-62.SB50381.VAST_1453-62.beam33_averaged_cal.leakage.ms.tar"  # BATCH_PROCESS=False 时生效，单个 .tar 文件路径
+TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic','COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel']
 MASK_RADIUS: int = 15     # 掩模半径（角秒）
-MAX_CONCURRENT_MS: int = 2     # 同时并行处理的 MS 压缩包数量
-WSCLEAN_THREADS: int = 25     # 每个 WSClean 进程分配的线程数（例如 2*25 = 50核并发）
-
-# 掩模半径（角秒）
-MASK_RADIUS: int = 15
-WSCLEAN_THREADS: int = 25
+MAX_CONCURRENT_MS: int = 7     # 同时并行处理的 MS 压缩包数量
+WSCLEAN_THREADS: int = 8     # 每个 WSClean 进程分配的线程数
 
 
 # --- 辅助函数 ---
@@ -70,11 +66,13 @@ def extract_sbid_and_beam(filename: str) -> Tuple[Optional[str], Optional[str]]:
 
 def run_cmd(cmd_str: str, cwd: str) -> None:
     conda_bin_dir = os.path.dirname(sys.executable)
+    conda_lib_dir = os.path.join(os.path.dirname(conda_bin_dir), "lib")
     custom_env = os.environ.copy()
     custom_env["PATH"] = conda_bin_dir + os.pathsep + custom_env.get("PATH", "")
+    custom_env["LD_LIBRARY_PATH"] = conda_lib_dir + os.pathsep + custom_env.get("LD_LIBRARY_PATH", "")
+    cmd_str = f"env LD_LIBRARY_PATH={custom_env['LD_LIBRARY_PATH']} {cmd_str}"
 
     try:
-        # 使用 shell=True 以兼容 C++ 底层库文件流处理
         subprocess.run(cmd_str, shell=True, check=True, cwd=cwd, executable='/bin/bash', env=custom_env)
     except subprocess.CalledProcessError as e:
         logger.error(f"命令执行失败: {cmd_str}")
@@ -146,7 +144,7 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
     logger.info(
         f"坐标计算 J2015.5 -> {obs_time.datetime.date()}: RA {corr_ra}, DEC {corr_dec}")
 
-    existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-image.fits"))
+    existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-*"))
     wsclean_done = os.path.exists(wsclean_sentinel) and len(existing_mfs_images) > 0
 
     if not wsclean_done:
@@ -157,10 +155,10 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
 
         with tarfile.open(tar_path, 'r') as tar:
             tar.extractall(path=workspace_dir)
-
-        t = pt.table(os.path.join(workspace_dir, extracted_folder_name))
-        t.copy(os.path.join(workspace_dir, clean_ms_name), deep=True, valuecopy=True)
-        t.close()
+        os.rename(
+            os.path.join(workspace_dir, extracted_folder_name),
+            os.path.join(workspace_dir, clean_ms_name)
+        )
 
         logger.info("执行预处理 (dstools-askap-preprocess)...")
         run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
@@ -186,15 +184,9 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
     subtraction_done = os.path.exists(subtracted_ms_path) and os.path.exists(subtraction_sentinel)
 
     if not subtraction_done:
-        logger.info(f"--> [STEP 3] 插入模型 (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
+        logger.info(f"--> [STEP 3] 插入模型并写入 MODEL_DATA (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
         run_cmd(
             f"dstools-insert-model -p {corr_ra} {corr_dec} -r {MASK_RADIUS} {wsclean_model_dir_name} {clean_ms_name}",
-            cwd=workspace_dir)
-
-        # 模型数据预测回写，填充 MODEL_DATA 列
-        logger.info("--> [STEP 3.5] 模型数据预测回写 (MODEL_DATA)...")
-        run_cmd(
-            f"wsclean -predict -name {wsclean_model_dir_name}/wsclean -channels-out 8 -pol iv {clean_ms_name}",
             cwd=workspace_dir)
 
         logger.info(f"--> [STEP 4] 执行背景减除 (dstools-subtract-model)...")
@@ -273,56 +265,89 @@ def main() -> None:
     stars_df['hostname_clean'] = stars_df['hostname'].astype(str).str.strip().str.replace(' ', '_')
     star_catalog_dict = stars_df.drop_duplicates(subset=['hostname_clean']).set_index('hostname_clean').to_dict('index')
 
-    star_folders = glob.glob(os.path.join(CASDA_BASE_PATH, '*'))
+    if BATCH_PROCESS:
+        logger.info("Mode: BATCH")
+        star_folders = glob.glob(os.path.join(CASDA_BASE_PATH, '*'))
 
-    for folder in star_folders:
-        if not os.path.isdir(folder): continue
-        dir_name = os.path.basename(folder)
+        for folder in star_folders:
+            if not os.path.isdir(folder): continue
+            dir_name = os.path.basename(folder)
 
-        if TARGET_SOURCES:
-            is_matched = False
-            for target in TARGET_SOURCES:
-                norm_target = str(target).strip().replace(' ', '_').lower()
-                norm_dir = str(dir_name).strip().replace(' ', '_').lower()
-                if norm_target in norm_dir or norm_dir in norm_target:
-                    is_matched = True
+            if TARGET_SOURCES:
+                is_matched = False
+                for target in TARGET_SOURCES:
+                    norm_target = str(target).strip().replace(' ', '_').lower()
+                    norm_dir = str(dir_name).strip().replace(' ', '_').lower()
+                    if norm_target in norm_dir or norm_dir in norm_target:
+                        is_matched = True
+                        break
+                if not is_matched: continue
+
+            dir_name = os.path.basename(folder)
+            norm_dir = re.sub(r'[^a-zA-Z0-9]', '', dir_name).lower()
+
+            if TARGET_SOURCES:
+                is_matched = False
+                for target in TARGET_SOURCES:
+                    norm_target = re.sub(r'[^a-zA-Z0-9]', '', target).lower()
+                    if norm_target in norm_dir or norm_dir in norm_target:
+                        is_matched = True
+                        break
+                if not is_matched:
+                    continue
+
+            matched_key = None
+            for k in star_catalog_dict.keys():
+                norm_k = re.sub(r'[^a-zA-Z0-9]', '', k).lower()
+                if norm_k in norm_dir or norm_dir in norm_k:
+                    matched_key = k
                     break
-            if not is_matched: continue
 
-        dir_name = os.path.basename(folder)
-        # 用正则剔除文件夹名字里的所有下划线、空格、横杠，只保留纯字母和数字，并转小写
-        norm_dir = re.sub(r'[^a-zA-Z0-9]', '', dir_name).lower()
-
-        # 2. 目标源过滤
-        if TARGET_SOURCES:
-            is_matched = False
-            for target in TARGET_SOURCES:
-                norm_target = re.sub(r'[^a-zA-Z0-9]', '', target).lower()
-                if norm_target in norm_dir or norm_dir in norm_target:
-                    is_matched = True
-                    break
-            if not is_matched:
+            if not matched_key:
+                logger.warning(f"无法在星表中匹配到 {dir_name}，跳过。")
                 continue
 
-        # 3. 星表字典匹配
+            clean_hostname = matched_key
+            star_meta = star_catalog_dict[clean_hostname]
+            tar_files = glob.glob(os.path.join(folder, '*.tar'))
+
+            if not tar_files: continue
+
+            process_entire_source(clean_hostname, tar_files, star_meta, sbid_to_mjd)
+    else:
+        logger.info("Mode: SINGLE")
+        if not SINGLE_TAR_FILE or not os.path.exists(SINGLE_TAR_FILE):
+            logger.critical(f"SINGLE_TAR_FILE 路径无效: {SINGLE_TAR_FILE}")
+            return
+
+        tar_path = SINGLE_TAR_FILE
+        sbid, beam = extract_sbid_and_beam(os.path.basename(tar_path))
+        if not sbid or not beam:
+            logger.error("无法从文件名提取 SBID/beam")
+            return
+        if sbid not in sbid_to_mjd:
+            logger.error(f"SBID {sbid} 未在目录中找到")
+            return
+
+        obs_mjd = sbid_to_mjd[sbid]
+        tar_filename = os.path.basename(tar_path)
+        # 按文件夹名匹配星表
+        folder = os.path.dirname(tar_path)
+        dir_name = os.path.basename(folder)
+        norm_dir = re.sub(r'[^a-zA-Z0-9]', '', dir_name).lower()
         matched_key = None
         for k in star_catalog_dict.keys():
             norm_k = re.sub(r'[^a-zA-Z0-9]', '', k).lower()
             if norm_k in norm_dir or norm_dir in norm_k:
                 matched_key = k
                 break
-
         if not matched_key:
-            logger.warning(f"无法在星表中匹配到 {dir_name}，跳过。")
-            continue
-
+            logger.error(f"无法匹配源名: {dir_name}")
+            return
         clean_hostname = matched_key
         star_meta = star_catalog_dict[clean_hostname]
-        tar_files = glob.glob(os.path.join(folder, '*.tar'))
 
-        if not tar_files: continue
-
-        process_entire_source(clean_hostname, tar_files, star_meta, sbid_to_mjd)
+        process_single_tar(tar_path, clean_hostname, star_meta, sbid, beam, obs_mjd)
 
 
 if __name__ == "__main__":
