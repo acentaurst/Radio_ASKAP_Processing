@@ -34,10 +34,10 @@ MASTER_OUTPUT_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Re
 BATCH_PROCESS = False
 
 # 如果关闭了批量处理 (设为False)，请在这里填入你要单独出图的那个 .ds 文件的相对/绝对位置
-SINGLE_DS_FILE = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/HD_180902/HD_180902_SB51766_beam32.ds'
+SINGLE_DS_FILE = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/2MASS_J01033563-5515561_A/2MASS_J01033563-5515561_A_SB59565_beam22.ds'
 
 # 绘图参数
-T_AVG = 48    # 时间平均因子
+T_AVG = 12    # 时间平均因子
 F_AVG = 5    # 频率平均因子
 I_LIMIT = 5  # Stokes I 辐射通量范围上限 (mJy)
 V_LIMIT = 5  # Stokes V 辐射通量范围上限 (mJy)

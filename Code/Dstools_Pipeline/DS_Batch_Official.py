@@ -157,8 +157,11 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
             os.path.join(workspace_dir, clean_ms_name)
         )
 
-        logger.info("执行预处理 (dstools-askap-preprocess)...")
-        run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
+        if "RACS" in extracted_folder_name:
+            logger.info("RACS 数据已自带预处理，跳过 dstools-askap-preprocess")
+        else:
+            logger.info("执行预处理 (dstools-askap-preprocess)...")
+            run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
 
         logger.info(f"执行 dstools-create-model 建模...")
         os.makedirs(wsclean_model_full_path, exist_ok=True)

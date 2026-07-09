@@ -1,6 +1,5 @@
 import os
 import glob
-import datetime
 import argparse
 import warnings
 import numpy as np
@@ -8,39 +7,25 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import lightkurve as lk
 from astropy.io import fits
-from scipy.signal import find_peaks
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="astropy")
 
 plt.rcParams["axes.unicode_minus"] = False
 
 # ========================
-DEFAULT_DATA_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data/GJ_896_A"
+DEFAULT_DATA_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data/2MASS_J01033563-5515561_A"
 OUTPUT_BASE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/TESS_Lightcurve_PhaseFolding"
 
-# 周期分析方法与手动周期
-METHOD = "manual"           # "LS": Lomb-Scargle 周期图 / "ACF": 自相关函数 / "manual": 手动指定
-MANUAL_PERIOD = 1.06   # METHOD="manual" 时生效（天）
-PERIOD_MIN = 0.01      # LS 周期搜索下限 / ACF 最短滞后（天）
-PERIOD_MAX = 200       # LS 周期搜索上限 / ACF 最长滞后（天）
+# 周期分析
+USE_MANUAL_PERIOD = False   # True: 用手动指定周期; False: Lomb-Scargle 自动搜索
+MANUAL_PERIOD = 1.06        # 手动周期（天）
+PERIOD_MIN = 0.05           # LS 周期搜索下限（天）
+PERIOD_MAX = 20             # LS 周期搜索上限（天），自动限制 ≤ 基线/2
+USE_FLATTEN_FOR_LS = True   # True: LS 用去趋势数据; False: 用原始归一化数据
+FLATTEN_WINDOW = 721        # flatten 窗口长度上限（采样点数，~24h for 2-min cadence）
 
 COLOR_DATA = "#4a8fd4"
 COLOR_TREND = "#e74c3c"
-
-
-def sanitize_name(name):
-    return name.replace(" ", "_").replace("/", "_").replace("\\", "_")
-
-
-def format_date_obs(date_str):
-    try:
-        s = date_str.strip()
-        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is not None:
-            dt = dt.replace(tzinfo=None)
-        return f"{dt.year}-{dt.month:02d}-{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}"
-    except Exception:
-        return date_str
 
 
 def find_fits_files(data_dir):
@@ -62,38 +47,6 @@ def detect_data_type(fits_path):
     if basename.endswith("_tp.fits") or "_tp." in basename:
         return "TPF"
     return "FITS"
-
-
-def read_header_date(fits_path):
-    """从 FITS 头读取观测起始时间，兼容多种关键字和 HDU 位置。
-    返回 (date_str, is_approx): date_str 为日期字符串，is_approx 表示是否为 BJD 近似反推。
-    """
-    date_keys = [
-        "DATE-OBS", "DATE_OBS", "DATE-BEG", "DATE_BEG",
-        "DATEBEG", "DATE-BEG",
-    ]
-    try:
-        with fits.open(fits_path, memmap=True) as hdul:
-            for hdu in hdul:
-                for key in date_keys:
-                    val = hdu.header.get(key)
-                    if val is not None:
-                        return str(val), False
-            # DATE 字段都不存在时，从 TSTART + BJDREFI 反推（常见于 QLP/TGLC）
-            for hdu in hdul:
-                tstart = hdu.header.get("TSTART")
-                bjdrefi = hdu.header.get("BJDREFI", 2457000)
-                if tstart is not None:
-                    try:
-                        bjd = float(bjdrefi) + float(tstart)
-                        jd2000 = 2451544.5
-                        dt = datetime.datetime(2000, 1, 1) + datetime.timedelta(days=bjd - jd2000)
-                        return f"{dt.year}-{dt.month:02d}-{dt.day:02d}", True
-                    except Exception:
-                        pass
-            return "未知", False
-    except Exception:
-        return "未知", False
 
 
 def read_sector_from_header(fits_path):
@@ -183,6 +136,15 @@ def plot_one(fits_path, target_name, output_dir, data_dir, file_index):
         print(f"    无法读取，跳过: {e}")
         return None
 
+    # 从原始 LC（清洗前）取观测时间范围（lc.time 已是 astropy Time，无需手动转换）
+    btjd_start = lc.time[0].value
+    btjd_end = lc.time[-1].value
+    date_label = (
+        f"BTJD {btjd_start:.3f}–{btjd_end:.3f}    "
+        f"{lc.time[0].utc.strftime('%Y-%m-%d %H:%M')} — "
+        f"{lc.time[-1].utc.strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+
     lc_clean = lc.remove_nans().remove_outliers(sigma=5)
     time_btjd = lc_clean.time.value
     flux_median = float(np.median(lc_clean.flux.value))
@@ -193,15 +155,15 @@ def plot_one(fits_path, target_name, output_dir, data_dir, file_index):
         print(f"    数据点太少 ({len(time_btjd)}), 跳过")
         return None
 
+    # 自动限制周期搜索上限（不超过基线一半）
+    baseline = time_btjd[-1] - time_btjd[0]
+    period_max = min(PERIOD_MAX, baseline / 2)
+
     sector = extract_sector(fits_path)
-    date_obs, is_approx = read_header_date(fits_path)
-    date_label = format_date_obs(date_obs)
-    if is_approx:
-        date_label = f"~ {date_label}  (BJD approx)"
     sector_str = f"Sector {sector}" if sector else rel_path[:50]
 
     # 画布（3 行：光变曲线 / 周期图 / 相位折叠）
-    fig = plt.figure(figsize=(13, 11), facecolor="white")
+    fig = plt.figure(figsize=(12, 10), facecolor="white")
     gs = fig.add_gridspec(3, 1, height_ratios=[1.4, 1, 1.2], hspace=0.35)
 
     # =================================================================
@@ -214,14 +176,24 @@ def plot_one(fits_path, target_name, output_dir, data_dir, file_index):
 
     trend_label = ""
     try:
+        # 自适应窗口长度，避免超过数据点数
+        n_data = len(lc_norm)
+        window = min(FLATTEN_WINDOW, n_data // 5 * 2 + 1)
+        window = max(window, 101)
+        if window % 2 == 0:
+            window -= 1
         lc_flat, trend_lc = lc_norm.flatten(
-            window_length=101, return_trend=True
+            window_length=window, return_trend=True
         )
         ax_lc.plot(trend_lc.time.value, trend_lc.flux.value,
                    color=COLOR_TREND, linewidth=1.4, alpha=0.9)
         trend_label = " (spline trend)"
     except Exception:
+        print(f"     flatten 失败，回退到原始归一化数据")
         lc_flat = lc_norm
+
+    lc_analysis = lc_flat if USE_FLATTEN_FOR_LS else lc_norm
+    flux_phase = lc_analysis.flux.value
 
     ax_lc.set_ylabel("Normalized Flux", fontsize=13, color="#333333")
     ax_lc.set_xlabel("BTJD  (BJD - 2457000)  [days]", fontsize=13, color="#333333")
@@ -233,9 +205,9 @@ def plot_one(fits_path, target_name, output_dir, data_dir, file_index):
         spine.set_color("#cccccc")
 
     ax_lc.set_title(
-        f"{target_name}    {sector_str}  [{data_type}]    "
-        f"Obs. start: {date_label}",
-        fontsize=14, fontweight="bold", color="#2c3e50", loc="left",
+        f"{target_name}\n"
+        f"{sector_str} [{data_type}]    {date_label}",
+        fontsize=13, fontweight="bold", color="#2c3e50", loc="left",
     )
 
     from matplotlib.lines import Line2D
@@ -257,140 +229,89 @@ def plot_one(fits_path, target_name, output_dir, data_dir, file_index):
     ax_lc.tick_params(labelsize=10, colors="#555555")
 
     # =================================================================
-    # 中: 周期分析 (LS / ACF / manual)
+    # 中: Lomb-Scargle Periodogram
     # =================================================================
     ax_pg = fig.add_subplot(gs[1])
 
     peak_period = None
     peak_amplitude = None
 
-    if METHOD == "LS":
-        try:
-            pg = lc_flat.to_periodogram(
-                minimum_period=PERIOD_MIN, maximum_period=PERIOD_MAX,
-                oversample_factor=10, normalization="amplitude",
-            )
+    try:
+        pg = lc_analysis.to_periodogram(
+            minimum_period=PERIOD_MIN, maximum_period=period_max,
+            oversample_factor=10, normalization="amplitude",
+        )
+        periods = pg.period.value
+        power = pg.power.value
 
-            periods = pg.period.value
-            power = pg.power.value
+        if USE_MANUAL_PERIOD:
+            peak_period = MANUAL_PERIOD
+            peak_idx = np.abs(periods - peak_period).argmin()
+            peak_amplitude = power[peak_idx]
+        else:
             peak_period = pg.period_at_max_power.value
             peak_amplitude = pg.max_power.value
 
-            ax_pg.plot(periods, power, color="#2980b9", linewidth=0.8, alpha=0.9)
-            ax_pg.fill_between(periods, 0, power, color="#2980b9", alpha=0.08)
-            ax_pg.set_xscale("log")
-            ax_pg.xaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=8))
-            ax_pg.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.4g"))
-            ax_pg.xaxis.set_minor_formatter(ticker.NullFormatter())
+        # 共用绘图
+        ax_pg.plot(periods, power, color="#2980b9", linewidth=0.8, alpha=0.9)
+        ax_pg.fill_between(periods, 0, power, color="#2980b9", alpha=0.08)
+        ax_pg.set_xscale("log")
+        ax_pg.xaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=8))
+        ax_pg.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.4g"))
+        ax_pg.xaxis.set_minor_formatter(ticker.NullFormatter())
 
-            fap_styles = [
-                (0.01, "#e74c3c", "FAP 1%"),
-                (0.05, "#e67e22", "FAP 5%"),
-                (0.10, "#f1c40f", "FAP 10%"),
-            ]
-            for fap_level, color, label in fap_styles:
+        # FAP（仅自动模式有意义）
+        if not USE_MANUAL_PERIOD:
+            for fap_level, color, label in [
+                (0.01, "#e74c3c", "FAP 1%"), (0.05, "#e67e22", "FAP 5%"), (0.10, "#f1c40f", "FAP 10%")
+            ]:
                 try:
                     amp_level = pg.false_alarm_level(fap_level)
-                    ax_pg.axhline(amp_level, color=color, linestyle="--",
-                                  linewidth=0.8, alpha=0.7)
-                    ax_pg.text(periods[-1] * 0.95, amp_level,
-                               f"  {label}", fontsize=8, color=color,
-                               va="bottom", alpha=0.85)
+                    ax_pg.axhline(amp_level, color=color, linestyle="--", linewidth=0.8, alpha=0.7)
+                    ax_pg.text(periods[-1] * 0.95, amp_level, f"  {label}", fontsize=8, color=color, va="bottom", alpha=0.85)
                 except Exception:
                     pass
 
-            ax_pg.axvline(peak_period, color=COLOR_TREND, linestyle="--",
-                          linewidth=1.2, alpha=0.8)
-            ax_pg.annotate(
-                f"  Peak: {peak_period:.4f} d",
-                xy=(peak_period, peak_amplitude),
-                xytext=(peak_period * 1.5, peak_amplitude * 0.88),
-                fontsize=11, color=COLOR_TREND, fontweight="bold",
-                arrowprops=dict(arrowstyle="->", color=COLOR_TREND,
-                                lw=0.8, connectionstyle="arc3,rad=0.2"),
-            )
+        # 标记峰值
+        ax_pg.axvline(peak_period, color=COLOR_TREND, linestyle="--", linewidth=1.2, alpha=0.8)
+        label_text = f"  Manual: {peak_period:.4f} d" if USE_MANUAL_PERIOD else f"  Peak: {peak_period:.4f} d"
+        ax_pg.annotate(
+            label_text,
+            xy=(peak_period, peak_amplitude),
+            xytext=(peak_period * 1.5, peak_amplitude * 0.88),
+            fontsize=11, color=COLOR_TREND, fontweight="bold",
+            arrowprops=dict(arrowstyle="->", color=COLOR_TREND, lw=0.8, connectionstyle="arc3,rad=0.2"),
+        )
 
-            ylim = ax_pg.get_ylim()
-            for mult, label in [(0.5, "1/2"), (2, "2x")]:
-                alias_p = peak_period * mult
-                if periods.min() < alias_p < periods.max():
-                    ax_pg.axvline(alias_p, color="#999999", linestyle=":",
-                                  linewidth=0.6, alpha=0.5)
-                    ax_pg.text(alias_p, ylim[1] * 0.92, label,
-                               fontsize=9, color="#999999", ha="center")
+        # Alias 线
+        ylim = ax_pg.get_ylim()
+        for mult, alias_label in [(0.5, "1/2"), (2, "2x"), (3, "3x")]:
+            alias_p = peak_period * mult
+            if periods.min() < alias_p < periods.max():
+                ax_pg.axvline(alias_p, color="#999999", linestyle=":", linewidth=0.6, alpha=0.5)
+                ax_pg.text(alias_p, ylim[1] * 0.92, alias_label, fontsize=9, color="#999999", ha="center")
 
-            x_min = max(periods.min(), peak_period * 0.3)
-            x_max = min(periods.max(), peak_period * 8)
-            ax_pg.set_xlim(x_min, x_max)
+        ax_pg.set_xlim(periods.min(), periods.max())
+        ax_pg.set_xlabel("Period  [days]  (log scale)", fontsize=13, color="#333333")
+        ax_pg.set_ylabel("LS Power  [normalized flux]", fontsize=13, color="#333333")
+        detrend_tag = " (detrended)" if USE_FLATTEN_FOR_LS else ""
+        title = f"Lomb-Scargle{detrend_tag}    Manual P = {MANUAL_PERIOD:.4f} d" if USE_MANUAL_PERIOD else f"Lomb-Scargle{detrend_tag}    P = {peak_period:.4f} d    Amp = {peak_amplitude:.4f}"
+        if not USE_MANUAL_PERIOD:
+            try:
+                fap = pg.false_alarm_probability(peak_amplitude)
+                title += f"    FAP = {fap:.2e}"
+            except Exception:
+                pass
+        ax_pg.set_title(title, fontsize=12, color="#555555", loc="left", fontweight="normal")
 
-            ax_pg.set_xlabel("Period  [days]  (log scale)", fontsize=13, color="#333333")
-            ax_pg.set_ylabel("Amplitude  [normalized flux]", fontsize=13, color="#333333")
-            ax_pg.set_title(
-                f"Lomb-Scargle    Peak: {peak_period:.4f} d    Amp: {peak_amplitude:.4f}",
-                fontsize=12, color="#555555", loc="left", fontweight="normal",
-            )
-
-        except Exception as e:
-            ax_pg.text(0.5, 0.5, f"LS failed\n{e}",
-                       transform=ax_pg.transAxes, ha="center", va="center",
-                       fontsize=10, color="#999999")
-            ax_pg.set_xticks([])
-            ax_pg.set_yticks([])
-
-    elif METHOD == "ACF":
-        try:
-            dt = np.nanmedian(np.diff(time_btjd))
-            flux_centered = flux - np.nanmedian(flux)
-            flux_filled = np.where(np.isnan(flux_centered), 0.0, flux_centered)
-            acf = np.correlate(flux_filled, flux_filled, mode='full')
-            acf = acf[len(acf)//2:]
-            acf /= acf[0]
-
-            # 找 ACF 峰（只在 [PERIOD_MIN, PERIOD_MAX] 范围内找）
-            lag_min = max(0, int(PERIOD_MIN / dt))
-            lag_max = min(len(acf), int(PERIOD_MAX / dt) + 1)
-            acf_crop = acf[lag_min:lag_max]
-            peaks, props = find_peaks(acf_crop, prominence=0.03, distance=3)
-            if len(peaks) > 0:
-                best_idx = lag_min + peaks[np.argmax(props['prominences'])]
-                peak_period = best_idx * dt
-                peak_amplitude = acf[best_idx]
-
-            lags = np.arange(len(acf)) * dt
-            ax_pg.plot(lags, acf, color="#2980b9", linewidth=0.8, alpha=0.9)
-            ax_pg.axhline(y=0, color="gray", linestyle=":", linewidth=0.5)
-            if peak_period is not None:
-                ax_pg.axvline(peak_period, color=COLOR_TREND, linestyle="--",
-                              linewidth=1.2, alpha=0.8)
-                ax_pg.annotate(
-                    f"  P = {peak_period:.4f} d",
-                    xy=(peak_period, peak_amplitude),
-                    xytext=(peak_period * 1.5, peak_amplitude * 0.88),
-                    fontsize=11, color=COLOR_TREND, fontweight="bold",
-                    arrowprops=dict(arrowstyle="->", color=COLOR_TREND,
-                                    lw=0.8, connectionstyle="arc3,rad=0.2"),
-                )
-            ax_pg.set_xlim(0, min(lags[-1], PERIOD_MAX))
-            ax_pg.set_xlabel("Lag  [days]", fontsize=13, color="#333333")
-            ax_pg.set_ylabel("ACF", fontsize=13, color="#333333")
-            ax_pg.set_title(
-                f"Autocorrelation    "
-                f"P = {peak_period:.4f} d    "
-                f"Peak = {peak_amplitude:.3f}" if peak_period else "Autocorrelation",
-                fontsize=12, color="#555555", loc="left", fontweight="normal",
-            )
-
-        except Exception as e:
-            ax_pg.text(0.5, 0.5, f"ACF failed\n{e}",
-                       transform=ax_pg.transAxes, ha="center", va="center",
-                       fontsize=10, color="#999999")
-            ax_pg.set_xticks([])
-            ax_pg.set_yticks([])
-
-    else:  # manual
-        peak_period = MANUAL_PERIOD
-        ax_pg.text(0.5, 0.5, f"Manual P = {MANUAL_PERIOD:.4f} d",
-                   transform=ax_pg.transAxes, ha="center", va="center",
+    except Exception as e:
+        if USE_MANUAL_PERIOD:
+            peak_period = MANUAL_PERIOD
+            print(f"     LS failed, using manual period P={MANUAL_PERIOD:.4f} d")
+        else:
+            peak_period = None
+            peak_amplitude = None
+        ax_pg.text(0.5, 0.5, f"LS failed\n{e}", transform=ax_pg.transAxes, ha="center", va="center",
                    fontsize=10, color="#999999")
         ax_pg.set_xticks([])
         ax_pg.set_yticks([])
@@ -409,33 +330,36 @@ def plot_one(fits_path, target_name, output_dir, data_dir, file_index):
     ax_pf = fig.add_subplot(gs[2])
 
     if peak_period is not None and peak_period > 0:
-        phase = ((time_btjd - time_btjd[0]) / peak_period) % 1.0
-        ax_pf.scatter(phase, flux, s=4, c=COLOR_DATA, alpha=0.45,
-                      rasterized=True, linewidths=0)
+        phase = (time_btjd / peak_period) % 1.0
+        ax_pf.scatter(phase, flux_phase, s=4, c=COLOR_DATA, alpha=0.25,
+                       rasterized=True, linewidths=0)
+        ax_pf.scatter(phase + 1.0, flux_phase, s=4, c=COLOR_DATA, alpha=0.25,
+                       rasterized=True, linewidths=0)
 
-        # 二倍相位展示（视觉连续）
-        ax_pf.scatter(phase + 1.0, flux, s=4, c=COLOR_DATA, alpha=0.45,
-                      rasterized=True, linewidths=0)
-
-        # 分箱中值曲线
-        n_bins = 60
+        n_bins = max(20, min(80, int(len(flux_phase) / 15)))
         bins = np.linspace(0, 2, n_bins * 2 + 1)
         bin_centers = (bins[:-1] + bins[1:]) / 2
         bin_medians = np.full(len(bin_centers), np.nan)
+        bin_errs = np.full(len(bin_centers), np.nan)
         phase_ext = np.concatenate([phase, phase + 1.0])
-        flux_ext = np.concatenate([flux, flux])
+        flux_ext = np.concatenate([flux_phase, flux_phase])
         for j in range(len(bin_centers)):
             mask = (phase_ext >= bins[j]) & (phase_ext < bins[j + 1])
-            if np.sum(mask) > 5:
-                bin_medians[j] = np.median(flux_ext[mask])
+            n = np.sum(mask)
+            if n > 5:
+                bin_medians[j] = np.nanmedian(flux_ext[mask])
+                bin_errs[j] = 1.253 * np.nanstd(flux_ext[mask]) / np.sqrt(n)
         valid = ~np.isnan(bin_medians)
-        ax_pf.plot(bin_centers[valid], bin_medians[valid],
-                   color=COLOR_TREND, linewidth=1.6, alpha=0.9,
-                   label="Binned median")
+        ax_pf.errorbar(bin_centers[valid], bin_medians[valid],
+                       yerr=bin_errs[valid],
+                       fmt='o', color=COLOR_TREND, markersize=3,
+                       linewidth=1.2, capsize=2, alpha=0.9,
+                       label="Binned median ± SEM")
 
         ax_pf.set_xlim(0, 2)
         ax_pf.set_xlabel("Phase", fontsize=13, color="#333333")
-        ax_pf.set_ylabel("Normalized Flux", fontsize=13, color="#333333")
+        phase_ylabel = "Detrended Flux" if USE_FLATTEN_FOR_LS else "Normalized Flux"
+        ax_pf.set_ylabel(phase_ylabel, fontsize=13, color="#333333")
         ax_pf.set_title(
             f"Phase Folding    P = {peak_period:.6f} d",
             fontsize=12, color="#555555", loc="left", fontweight="normal",
@@ -461,7 +385,7 @@ def plot_one(fits_path, target_name, output_dir, data_dir, file_index):
     # 保存
     os.makedirs(output_dir, exist_ok=True)
     output_path = build_output_name(output_dir, sector, data_type, file_index)
-    fig.savefig(output_path, dpi=200, bbox_inches="tight",
+    fig.savefig(output_path, dpi=300, bbox_inches="tight",
                 facecolor="white", edgecolor="none")
     plt.close(fig)
     print(f"    -> {os.path.basename(output_path)}")
@@ -499,7 +423,6 @@ def main():
         output_dir = args.output_dir
     else:
         output_dir = os.path.join(OUTPUT_BASE, source_name)
-    output_dir = os.path.join(output_dir, METHOD)  # 按方法分子目录
 
     if not os.path.isdir(data_dir):
         print(f"数据目录不存在: {data_dir}")

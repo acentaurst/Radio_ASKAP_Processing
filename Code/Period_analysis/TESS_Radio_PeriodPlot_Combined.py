@@ -9,18 +9,19 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import matplotlib.patheffects as pe
 import lightkurve as lk
+from astropy.time import Time
 from dstools.dynamic_spectrum import DynamicSpectrum
 
 # ==========================================
 # 1. 手动配置区
 # ==========================================
-PERIOD = 0.0224  # 折叠周期 (天)
+PERIOD = 0.1664  # 折叠周期 (天)
 
 # DS 文件路径
-DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/HD_95086/HD_95086_SB54805_beam24.ds"
+DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/2MASS_J01033563-5515561_A/2MASS_J01033563-5515561_A_SB59565_beam22.ds"
 
 # TESS FITS 文件路径 (手动选择)
-TESS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data/HD_95086/Sector_65/mastDownload/TESS/tess2023124020739-s0065-0000000399637637-0259-s/tess2023124020739-s0065-0000000399637637-0259-s_tp.fits"
+TESS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Data/TESS_Data/2MASS_J01033563-5515561_A/Sector_00/mastDownload/HLSP/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc.fits"
 
 # 输出根目录（会自动按源名/SBID 分类）
 OUTPUT_BASE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/TESS_Radio_PeriodPlot_Combined"
@@ -30,9 +31,15 @@ I_LIMIT = 5
 V_LIMIT = 5
 
 # 时间/频率平均因子
-T_AVG_LC = 48    # 光变曲线时间平均
-T_AVG_DS = 24   # 动态谱时间平均
+T_AVG_LC = 12    # 光变曲线时间平均
+T_AVG_DS = 12   # 动态谱时间平均
 F_AVG = 5       # 频率平均因子
+
+SHOW_BASELINE_REMOVED = False  # True: 画去基线后的 I/V; False: 画原始 I/V
+
+# TESS 数据处理
+TESS_FLATTEN = True          # True: TESS 光变去趋势后再折叠
+FLATTEN_WINDOW_TESS = 401    # TESS flatten 窗口（采样点数）
 
 # 调色板
 COLOR_TESS = "#4a8fd4"
@@ -84,7 +91,8 @@ for _, row in df_cat.iterrows():
 if t0_mjd is None:
     print(f"ERROR: SBID {target_sbid} not found in catalogue")
     sys.exit(1)
-print(f"ASKAP obs start MJD (t0): {t0_mjd:.6f}")
+t0_mjd = Time(t0_mjd, format="mjd", scale="utc").tdb.mjd
+print(f"ASKAP obs start TDB MJD (t0): {t0_mjd:.6f}")
 
 
 # ==========================================
@@ -95,12 +103,19 @@ lc = lk.read(TESS_FILE)
 if hasattr(lc, "to_lightcurve"):
     lc = lc.to_lightcurve(aperture_mask="pipeline")
 lc = lc.remove_nans().remove_outliers(sigma=5)
+
+if TESS_FLATTEN:
+    try:
+        lc = lc.flatten(window_length=FLATTEN_WINDOW_TESS)
+        print(f"  TESS flattened (window={FLATTEN_WINDOW_TESS})")
+    except Exception:
+        print(f"  TESS flatten failed, using raw")
+
 flux_median = float(np.nanmedian(lc.flux.value))
 lc_norm = lc / flux_median
-tess_btjd = lc_norm.time.value
 tess_flux = lc_norm.flux.value
-tess_mjd = tess_btjd + 2457000 - 2400000.5
-print(f"  TESS data: {len(tess_btjd)} points, MJD range [{tess_mjd[0]:.4f}, {tess_mjd[-1]:.4f}]")
+tess_mjd = lc_norm.time.tdb.mjd
+print(f"  TESS data: {len(tess_flux)} points, TDB MJD range [{tess_mjd[0]:.4f}, {tess_mjd[-1]:.4f}]")
 
 period_hours = PERIOD * 24.0
 
@@ -116,8 +131,13 @@ stokes_v_2d_lc = np.real(ds_lc.data.get("V"))
 
 flux_i = np.nanmean(stokes_i_2d_lc, axis=1)
 flux_v = np.nanmean(stokes_v_2d_lc, axis=1)
-flux_i_detrend = flux_i - np.nanmedian(flux_i)
-flux_v_detrend = flux_v - np.nanmedian(flux_v)
+
+if SHOW_BASELINE_REMOVED:
+    flux_i_plot = flux_i - np.nanmedian(flux_i)
+    flux_v_plot = flux_v - np.nanmedian(flux_v)
+else:
+    flux_i_plot = flux_i
+    flux_v_plot = flux_v
 
 flux_i_err = np.nanstd(stokes_i_2d_lc, axis=1) / np.sqrt(len(ds_lc.freq))
 flux_v_err = np.nanstd(stokes_v_2d_lc, axis=1) / np.sqrt(len(ds_lc.freq))
@@ -129,7 +149,7 @@ ds_map = DynamicSpectrum(DS_FILE, tavg=T_AVG_DS, favg=F_AVG, trim=True)
 freqs = ds_map.freq
 stokes_i_2d = np.real(ds_map.data.get("I"))
 stokes_v_2d = np.real(ds_map.data.get("V"))
-t_phase = ds_map.time / period_hours  # 动态谱的相位轴
+t_phase = (ds_map.time - ds_map.time[0]) / period_hours  # 动态谱相位轴
 
 ds_duration = t_hours[-1] - t_hours[0]
 print(f"  DS: {len(ds_map.time)} time samples, {len(freqs)} freq channels")
@@ -152,8 +172,10 @@ phase_tess = (tess_mjd - t0_mjd) / PERIOD % 1.0
 tess_start_phase = (tess_mjd[0] - t0_mjd) / PERIOD % 1.0
 print(f"  TESS start phase (at t0): {tess_start_phase:.4f}")
 
-# ASKAP 相位 — 不折叠，原始映射 t_hours → phase
-phase_askap = t_hours / period_hours
+# ASKAP 相位 — 用绝对 TDB 时间（与 TESS 统一），不折叠
+t_abs_askap = Time(ds_lc.header["time_start"], scale=str(ds_lc.header.get("time_scale", "utc")).lower())
+t_abs_askap = t_abs_askap + (ds_lc.time * ds_lc.tunit)
+phase_askap = (t_abs_askap.tdb.mjd - t0_mjd) * 24.0 / period_hours
 
 # ==========================================
 # 7. TESS 相位分箱 (fold to [0, 1))
@@ -162,14 +184,18 @@ NBINS = 60
 bins = np.linspace(0, 1, NBINS + 1)
 bin_centers = (bins[:-1] + bins[1:]) / 2
 bin_medians = np.full(NBINS, np.nan)
+bin_errs = np.full(NBINS, np.nan)
 for i in range(NBINS):
     mask = (phase_tess >= bins[i]) & (phase_tess < bins[i + 1])
-    if np.sum(mask) > 5:
+    n = np.sum(mask)
+    if n > 5:
         bin_medians[i] = np.nanmedian(tess_flux[mask])
+        bin_errs[i] = np.nanstd(tess_flux[mask]) / np.sqrt(n)
 
 # 平铺到 [0, display_max)
 tiled_phases = np.concatenate([bin_centers + i for i in range(n_tiles)])
 tiled_flux = np.tile(bin_medians, n_tiles)
+tiled_errs = np.tile(bin_errs, n_tiles)
 valid = ~np.isnan(tiled_flux)
 
 # ==========================================
@@ -193,6 +219,12 @@ for offset in range(n_tiles):
 
 ax1.plot(tiled_phases[valid], tiled_flux[valid],
          color=COLOR_MEDIAN, linewidth=2.5, label="TESS folded median")
+# 中位数误差带
+if np.any(~np.isnan(tiled_errs)):
+    ax1.fill_between(tiled_phases[valid],
+                     tiled_flux[valid] - tiled_errs[valid],
+                     tiled_flux[valid] + tiled_errs[valid],
+                     color=COLOR_MEDIAN, alpha=0.15, linewidth=0)
 ax1.axhline(y=1.0, color="gray", linestyle=":", linewidth=0.8)
 ax1.set_xlim(0, display_max)
 y_min = np.nanpercentile(tess_flux, 5)
@@ -200,8 +232,8 @@ y_max = np.nanpercentile(tess_flux, 95)
 y_pad = (y_max - y_min) * 0.1
 ax1.set_ylim(y_min - y_pad, y_max + y_pad)
 ax1.set_ylabel("Relative Flux", fontsize=13, color="#333333")
-ax1.text(0.02, 0.95, f"TESS PhaseFolding  (P = {PERIOD:.4f} d)",
-         transform=ax1.transAxes, fontsize=12, fontweight="bold",
+ax1.text(0.02, 0.95, f"TESS PhaseFolding  (P = {PERIOD:.4f} d, \u03C6=0 at ASKAP t0)",
+          transform=ax1.transAxes, fontsize=12, fontweight="bold",
          color="white", ha="left", va="top",
          path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
 ax1.legend(fontsize=10, loc="upper right", framealpha=0.8, edgecolor="#dddddd")
@@ -217,16 +249,19 @@ ax1.tick_params(labelsize=10, colors="#555555")
 
 # --- Panel 2: ASKAP Stokes I/V Lightcurves ---
 ax2 = fig.add_subplot(gs[1, 0])
-ax2.errorbar(phase_askap, flux_i_detrend, yerr=flux_i_err,
-             fmt='-', color=COLOR_I, linewidth=0.8, capsize=2,
-             alpha=0.85, label="Stokes I")
-ax2.errorbar(phase_askap, flux_v_detrend, yerr=flux_v_err,
-             fmt='-', color=COLOR_V, linewidth=0.8, capsize=2,
-             alpha=0.85, label="Stokes V")
+ax2.errorbar(phase_askap, flux_i_plot, yerr=flux_i_err,
+              fmt='-', color=COLOR_I, linewidth=0.8, capsize=2,
+              alpha=0.85, label="Stokes I")
+ax2.errorbar(phase_askap, flux_v_plot, yerr=flux_v_err,
+              fmt='-', color=COLOR_V, linewidth=0.8, capsize=2,
+              alpha=0.85, label="Stokes V")
 ax2.axhline(y=0, color="gray", linestyle=":", linewidth=0.8)
 ax2.set_xlim(0, display_max)
-ax2.set_ylabel("Detrended Flux (mJy)", fontsize=13, color="#333333")
-ax2.text(0.02, 0.95, "Lightcurve",
+if SHOW_BASELINE_REMOVED:
+    ax2.set_ylabel("Baseline-removed Flux (mJy)", fontsize=13, color="#333333")
+else:
+    ax2.set_ylabel("Flux (mJy)", fontsize=13, color="#333333")
+ax2.text(0.02, 0.95, "Lightcurve (\u03C6=0 at ASKAP t0)",
          transform=ax2.transAxes, fontsize=12, fontweight="bold",
          color="white", ha="left", va="top",
          path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
@@ -288,10 +323,15 @@ print(f"\nImage saved: {out_img}")
 
 out_csv = os.path.join(OUTPUT_DIR, f"{basename_no_ext}_P{PERIOD}_PhaseInfo.csv")
 pd.DataFrame({
-    "parameter": ["t0_mjd", "period_days", "period_hours", "ds_duration_hours",
-                  "n_phases", "display_max", "n_tiles", "tess_start_phase"],
-    "value": [f"{t0_mjd:.6f}", f"{PERIOD:.6f}", f"{period_hours:.3f}",
+    "parameter": ["t0_tdb_mjd", "t0_definition", "period_days", "period_hours",
+                  "ds_duration_hours", "n_phases", "display_max", "n_tiles",
+                  "tess_start_phase", "tess_flatten", "flatten_window",
+                  "ds_file", "tess_file"],
+    "value": [f"{t0_mjd:.6f}", "ASKAP obs start time (SB first epoch)",
+              f"{PERIOD:.6f}", f"{period_hours:.3f}",
               f"{ds_duration:.3f}", f"{n_phases:.3f}", f"{display_max:.3f}",
-              f"{n_tiles}", f"{tess_start_phase:.4f}"]
+              f"{n_tiles}", f"{tess_start_phase:.4f}",
+              f"{TESS_FLATTEN}", f"{FLATTEN_WINDOW_TESS}",
+              os.path.basename(DS_FILE), os.path.basename(TESS_FILE)]
 }).to_csv(out_csv, index=False)
 print(f"Phase info saved: {out_csv}")

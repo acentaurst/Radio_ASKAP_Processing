@@ -51,8 +51,8 @@ VIP_TAR_FILES: List[str] = ['/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_
 ]
 
 MASK_RADIUS: int = 15  # 掩模半径（角秒）
-MAX_CONCURRENT_MS: int = 1  # VIP 通道的并发数量
-WSCLEAN_THREADS: int = 60  # VIP 专属分配的核心数
+MAX_CONCURRENT_MS: int = 3  # VIP 通道的并发数量
+WSCLEAN_THREADS: int = 16  # VIP 专属分配的核心数
 
 
 # --- 辅助函数 ---

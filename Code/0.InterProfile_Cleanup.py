@@ -39,8 +39,8 @@ def smart_clean_wsclean_models(results_dir):
             for file_path in glob.glob(os.path.join(model_dir, "*.fits")):
                 filename = os.path.basename(file_path)
 
-                # 核心保护逻辑：如果文件名里有 MFS，坚决不删！
-                if "MFS" not in filename:
+                # 保护逻辑：保留所有 *model* 和 *MFS* 文件，只删非必要的中间产物
+                if "model" not in filename and "MFS" not in filename:
                     try:
                         file_size = os.path.getsize(file_path)
                         os.remove(file_path)
