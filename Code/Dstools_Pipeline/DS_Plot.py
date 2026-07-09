@@ -48,7 +48,7 @@ F_AVG = 5
 SHOW_BASELINE_REMOVED = False
 
 # QC 图参数
-POL_FRAC_LIMIT = 50  # V/I 色标上限 (%)
+POL_FRAC_LIMIT = 100  # |V|/I 色标上限 (%)
 
 # MFS 图开关（画好后改成 False 省时间）
 INCLUDE_MFS = False    # True: 画 MFS 模型图; False: 跳过
@@ -413,7 +413,7 @@ def plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str):
     ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
     im3 = ax3.pcolormesh(time_map, freqs, pol_frac.T, cmap="RdYlBu_r",
                           shading="auto", rasterized=True,
-                          vmin=-POL_FRAC_LIMIT, vmax=POL_FRAC_LIMIT)
+                          vmin=0, vmax=POL_FRAC_LIMIT)
     ax3.set_ylim(freqs[0], freqs[-1])
     ax3.set_ylabel("Frequency (MHz)", fontsize=12)
     ax3.set_xlabel(time_label, fontsize=12)
