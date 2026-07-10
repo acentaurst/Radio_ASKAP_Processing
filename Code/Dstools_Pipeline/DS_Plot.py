@@ -14,6 +14,8 @@ from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astropy.time import Time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import h5py
 from dstools.dynamic_spectrum import DynamicSpectrum
 
 
@@ -32,27 +34,32 @@ def project_path(relative_path: str) -> str:
 # 配置区
 # ==========================================
 BATCH_PROCESS = False
-PIPELINE_RESULTS_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/Proxima_Cen/DS_Results"
+PIPELINE_RESULTS_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 # SINGLE_DS_FILE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/Proxima_Cen/DS_Results/Proxima_Cen_SB50381_beam33.ds"
 SINGLE_DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Data/Ds/2MASS_J01033563-5515561_A/flare/2MASS_J01033563-5515561_A_SB59565_beam22.ds"
 # MASTER_OUTPUT_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/Dynamic Spectrum"
 MASTER_OUTPUT_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Result/Dynamic_Spectrum/2MASS_J01033563-5515561_A"
 WSCLEAN_BASE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
+MAX_WORKERS = 4      # 批量模式并行线程数
+
 # 科学图参数
 I_LIMIT = 5
 V_LIMIT = 5
-T_AVG_LC = 12
-T_AVG_DS = 12
+TAVG_THRESHOLD_HOURS = 1.0   # 时长阈值（小时）
+TAVG_SHORT = 1               # < 阈值时用
+TAVG_LONG = 6                 # >= 阈值时用
 F_AVG = 5
 SHOW_BASELINE_REMOVED = False
 
 # QC 图参数
-POL_FRAC_LIMIT = 100  # |V|/I 色标上限 (%)
+POL_FRAC_LIMIT = 100  # |V|/I y轴上限 (%)
+TAVG_VI_FACTOR = 4   # V/I 光变曲线额外时间因子（长观测: 6×4=24, 短观测: 1×1=1）
 
 # MFS 图开关（画好后改成 False 省时间）
 INCLUDE_MFS = False    # True: 画 MFS 模型图; False: 跳过
 INCLUDE_QC = True     # True: 画 QC 诊断图; False: 跳过
+CHECK_LOCAL_EXISTS = True   # True: 检测本地文件，已存在则跳过; False: 不检测直接覆盖
 
 COLOR_I = "black"
 COLOR_V = "#e74c3c"
@@ -64,6 +71,17 @@ INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_dire
 # ==========================================
 # 辅助函数
 # ==========================================
+def _get_adaptive_tavg(ds_path):
+    """根据 .ds 文件时长自适应选择时间平均因子。返回 (tavg_lc, tavg_ds, duration_hours)。"""
+    with h5py.File(ds_path, "r") as f:
+        time_raw = f["time"][:]
+    duration_hours = (time_raw[-1] - time_raw[0]) / 3600.0
+    if duration_hours < TAVG_THRESHOLD_HOURS:
+        return TAVG_SHORT, TAVG_SHORT, duration_hours
+    else:
+        return TAVG_LONG, TAVG_LONG, duration_hours
+
+
 def find_wsclean_fits(hostname, sbid, beam, wsclean_base):
     base = f"{hostname}_SB{sbid}_beam{beam}"
     fits_dir = os.path.join(wsclean_base, hostname,
@@ -114,11 +132,12 @@ def get_target_coords(hostname, sbid):
 # ==========================================
 # 科学图：光变曲线 + I/V 动态谱
 # ==========================================
-def plot_science(ds_file, output_dir, hostname, sbid, beam, base_name_str):
-    print(f"  [Science] 绘制中...")
+def plot_science(ds_file, output_dir, hostname, sbid, beam, base_name_str,
+                 tavg_lc, tavg_ds):
+    print(f"  [Science] 绘制中... (tavg_lc={tavg_lc}, tavg_ds={tavg_ds})")
 
     try:
-        ds_lc = DynamicSpectrum(ds_path=ds_file, tavg=T_AVG_LC, favg=F_AVG, trim=True)
+        ds_lc = DynamicSpectrum(ds_path=ds_file, tavg=tavg_lc, favg=F_AVG, trim=True)
     except Exception as e:
         print(f"  Load failed: {e}")
         return
@@ -140,7 +159,7 @@ def plot_science(ds_file, output_dir, hostname, sbid, beam, base_name_str):
         flux_v_plot = flux_v
 
     try:
-        ds_map = DynamicSpectrum(ds_path=ds_file, tavg=T_AVG_DS, favg=F_AVG, trim=True)
+        ds_map = DynamicSpectrum(ds_path=ds_file, tavg=tavg_ds, favg=F_AVG, trim=True)
     except Exception as e:
         print(f"  Load failed: {e}")
         return
@@ -271,7 +290,7 @@ def plot_mfs(output_dir, hostname, sbid, beam, base_name_str):
         target_coord = SkyCoord(corr_ra * u.deg, corr_dec * u.deg, frame='icrs')
         coord_str = target_coord.to_string('hmsdms', precision=2)
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 14), facecolor="white")
+    fig, axes = plt.subplots(2, 1, figsize=(15, 12), facecolor="white")
 
     for ax, path, label, cmap in [
         (axes[0], fits_i_path, "MFS I-model", "magma"),
@@ -325,11 +344,11 @@ def plot_mfs(output_dir, hostname, sbid, beam, base_name_str):
 # ==========================================
 # QC 诊断图：Im(I) + Im(V) + V/I
 # ==========================================
-def plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str):
-    print(f"  [QC] 绘制中...")
+def plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str, tavg_ds):
+    print(f"  [QC] 绘制中... (tavg_ds={tavg_ds})")
 
     try:
-        ds = DynamicSpectrum(ds_path=ds_file, tavg=T_AVG_DS, favg=F_AVG, trim=True)
+        ds = DynamicSpectrum(ds_path=ds_file, tavg=tavg_ds, favg=F_AVG, trim=True)
     except Exception as e:
         print(f"  Load failed: {e}")
         return
@@ -366,17 +385,64 @@ def plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str):
     x_major_locator = ticker.MultipleLocator(major_step)
     x_minor_locator = ticker.AutoMinorLocator(5)
 
-    fig = plt.figure(figsize=(15, 14), facecolor="white")
+    # V/I lightcurve (frequency-averaged polarisation fraction)
+    pol_frac_lc = np.nanmean(pol_frac, axis=1)
+    n_freq_valid = np.sum(~np.isnan(pol_frac), axis=1)
+    n_freq_valid[n_freq_valid == 0] = 1
+    pol_frac_lc_err = np.nanstd(pol_frac, axis=1) / np.sqrt(n_freq_valid)
+
+    # V/I 光变曲线二次时间平均（长观测: tavg_ds × TAVG_VI_FACTOR = 6×4=24, 短观测: 1×1=1）
+    if duration >= TAVG_THRESHOLD_HOURS:
+        vi_extra = TAVG_VI_FACTOR
+    else:
+        vi_extra = 1
+    if vi_extra > 1 and len(pol_frac_lc) >= vi_extra:
+        n = len(pol_frac_lc) // vi_extra
+        sl = slice(0, n * vi_extra)
+        pol_frac_lc = np.nanmean(pol_frac_lc[sl].reshape(n, vi_extra), axis=1)
+        pol_frac_lc_err = np.sqrt(np.nansum(
+            pol_frac_lc_err[sl].reshape(n, vi_extra) ** 2, axis=1)) / vi_extra
+        time_map_vi = np.nanmean(time_map[sl].reshape(n, vi_extra), axis=1)
+    else:
+        time_map_vi = time_map.copy()
+
+    fig = plt.figure(figsize=(15, 12), facecolor="white")
     gs = fig.add_gridspec(3, 2, width_ratios=[20, 0.5],
-                          height_ratios=[1, 1, 1],
+                          height_ratios=[1, 1.2, 1.2],
                           hspace=0, wspace=0.08)
 
     title_str = f"Data Quality: {hostname}   |   SBID: {sbid}   |   Beam: {beam}"
     fig.suptitle(title_str, fontsize=18, fontweight='bold', y=0.98)
     fig.subplots_adjust(top=0.95, bottom=0.03)
 
-    # Panel 1: Im(Stokes I)
-    ax1 = fig.add_subplot(gs[0, 0])
+    # Panel 1: |V|/I lightcurve
+    ax_lc = fig.add_subplot(gs[0, 0])
+    ax_lc.errorbar(time_map_vi, pol_frac_lc, yerr=pol_frac_lc_err,
+                   fmt='-', color=COLOR_V, linewidth=0.8, capsize=2,
+                   alpha=0.85, label="|V|/I")
+    ax_lc.axhline(y=0, color="gray", linestyle=":", linewidth=0.8)
+    ax_lc.set_xlim(time_map_vi[0], time_map_vi[-1])
+    y_max_data = np.nanmax(pol_frac_lc) if np.isfinite(np.nanmax(pol_frac_lc)) else POL_FRAC_LIMIT
+    ax_lc.set_ylim(0, min(POL_FRAC_LIMIT, y_max_data * 1.2) if y_max_data > 0 else POL_FRAC_LIMIT)
+    ax_lc.set_ylabel("|V|/I (%)", fontsize=13, color="#333333")
+    ax_lc.text(0.02, 0.95, "|V|/I Lightcurve",
+               transform=ax_lc.transAxes, fontsize=12, fontweight="bold",
+               color="white", ha="left", va="top",
+               path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
+    ax_lc.legend(fontsize=10, loc="upper right", framealpha=0.8, edgecolor="#dddddd")
+    ax_lc.grid(True, linestyle="--", linewidth=0.3, alpha=0.5, color="#aaaaaa")
+    ax_lc.set_axisbelow(True)
+    ax_lc.xaxis.set_major_locator(x_major_locator)
+    ax_lc.xaxis.set_minor_locator(x_minor_locator)
+    ax_lc.yaxis.set_major_locator(ticker.MaxNLocator(5))
+    ax_lc.tick_params(axis='x', labelbottom=False)
+    ax_lc.tick_params(labelsize=10, colors="#555555")
+    for spine in ax_lc.spines.values():
+        spine.set_linewidth(0.5)
+        spine.set_color("#cccccc")
+
+    # Panel 2: Im(Stokes I)
+    ax1 = fig.add_subplot(gs[1, 0], sharex=ax_lc)
     vlim_i = np.nanpercentile(np.abs(im_i), 99)
     im1 = ax1.pcolormesh(time_map, freqs, im_i.T, cmap="coolwarm",
                           shading="auto", rasterized=True, vmin=-vlim_i, vmax=vlim_i)
@@ -386,15 +452,16 @@ def plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str):
              transform=ax1.transAxes, fontsize=12, fontweight="bold",
              color="white", ha="left", va="top",
              path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
-    cax1 = fig.add_subplot(gs[0, 1])
+    cax1 = fig.add_subplot(gs[1, 1])
     fig.colorbar(im1, cax=cax1, label="Im(I) (mJy)")
+    fig.canvas.draw()
+    pos1 = cax1.get_position()
+    cax1.set_position([pos1.x0, pos1.y0 + pos1.height * 0.05, pos1.width, pos1.height * 0.95])
     ax1.tick_params(axis='x', labelbottom=False)
-    ax1.xaxis.set_major_locator(x_major_locator)
-    ax1.xaxis.set_minor_locator(x_minor_locator)
     ax1.tick_params(labelsize=10, colors="#555555")
 
-    # Panel 2: Im(Stokes V)
-    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+    # Panel 3: Im(Stokes V)
+    ax2 = fig.add_subplot(gs[2, 0], sharex=ax_lc)
     vlim_v = np.nanpercentile(np.abs(im_v), 99)
     im2 = ax2.pcolormesh(time_map, freqs, im_v.T, cmap="coolwarm",
                           shading="auto", rasterized=True, vmin=-vlim_v, vmax=vlim_v)
@@ -404,27 +471,14 @@ def plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str):
              transform=ax2.transAxes, fontsize=12, fontweight="bold",
              color="white", ha="left", va="top",
              path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
-    cax2 = fig.add_subplot(gs[1, 1])
+    cax2 = fig.add_subplot(gs[2, 1])
     fig.colorbar(im2, cax=cax2, label="Im(V) (mJy)")
-    ax2.tick_params(axis='x', labelbottom=False)
+    fig.canvas.draw()
+    pos2 = cax2.get_position()
+    cax2.set_position([pos2.x0, pos2.y0 + pos2.height * 0.05, pos2.width, pos2.height * 0.95])
+    ax2.tick_params(axis='x', labelbottom=True)
+    ax2.set_xlabel(time_label, fontsize=12)
     ax2.tick_params(labelsize=10, colors="#555555")
-
-    # Panel 3: V/I
-    ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
-    im3 = ax3.pcolormesh(time_map, freqs, pol_frac.T, cmap="RdYlBu_r",
-                          shading="auto", rasterized=True,
-                          vmin=0, vmax=POL_FRAC_LIMIT)
-    ax3.set_ylim(freqs[0], freqs[-1])
-    ax3.set_ylabel("Frequency (MHz)", fontsize=12)
-    ax3.set_xlabel(time_label, fontsize=12)
-    ax3.text(0.02, 0.95, "|V|/I Circular Polarization Fraction",
-             transform=ax3.transAxes, fontsize=12, fontweight="bold",
-             color="white", ha="left", va="top",
-             path_effects=[pe.withStroke(linewidth=2.5, foreground="black")])
-    cax3 = fig.add_subplot(gs[2, 1])
-    fig.colorbar(im3, cax=cax3, label="|V|/I (%)")
-    ax3.tick_params(axis='x', labelbottom=True)
-    ax3.tick_params(labelsize=10, colors="#555555")
 
     source_specific_dir = os.path.join(output_dir, hostname)
     os.makedirs(source_specific_dir, exist_ok=True)
@@ -453,22 +507,49 @@ def process_ds_file(ds_file, output_dir):
         beam = beam_match.group(1) if beam_match else "UNKNOWN"
 
     base_name_str = f"{hostname}_SB{sbid}_beam{beam}"
+    source_specific_dir = os.path.join(output_dir, hostname)
+
+    science_out = os.path.join(source_specific_dir, f"{base_name_str}.png")
+    mfs_out     = os.path.join(source_specific_dir, f"{base_name_str}_MFS.png")
+    qc_out      = os.path.join(source_specific_dir, f"{base_name_str}_QC.png")
+
+    # 本地文件检测（由 CHECK_LOCAL_EXISTS 开关控制）
+    if CHECK_LOCAL_EXISTS:
+        science_done = os.path.exists(science_out)
+        mfs_done     = os.path.exists(mfs_out) if INCLUDE_MFS else True
+        qc_done      = os.path.exists(qc_out) if INCLUDE_QC else True
+    else:
+        science_done = mfs_done = qc_done = False
+
+    if CHECK_LOCAL_EXISTS and science_done and mfs_done and qc_done:
+        print(f"[跳过] {base_name_str} 全部已存在")
+        return
 
     print("-" * 60)
     print(f"Processing: {basename}")
 
-    # 1. 科学图（始终画）
-    plot_science(ds_file, output_dir, hostname, sbid, beam, base_name_str)
+    tavg_lc, tavg_ds, dur = _get_adaptive_tavg(ds_file)
+    print(f"  Duration: {dur:.2f}h -> tavg_lc={tavg_lc}, tavg_ds={tavg_ds}")
 
-    # 2. MFS 模型图（开关控制）
+    if not science_done:
+        plot_science(ds_file, output_dir, hostname, sbid, beam, base_name_str,
+                     tavg_lc, tavg_ds)
+    else:
+        print(f"  [跳过科学图] 已存在")
+
     if INCLUDE_MFS:
-        plot_mfs(output_dir, hostname, sbid, beam, base_name_str)
+        if not mfs_done:
+            plot_mfs(output_dir, hostname, sbid, beam, base_name_str)
+        else:
+            print(f"  [跳过MFS] 已存在")
     else:
         print("  [MFS] 已跳过（INCLUDE_MFS = False）")
 
-    # 3. QC 诊断图（开关控制）
     if INCLUDE_QC:
-        plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str)
+        if not qc_done:
+            plot_qc(ds_file, output_dir, hostname, sbid, beam, base_name_str, tavg_ds)
+        else:
+            print(f"  [跳过QC] 已存在")
     else:
         print("  [QC] 已跳过（INCLUDE_QC = False）")
 
@@ -477,17 +558,28 @@ def main():
     print("=" * 60)
     print(" ASKAP Dynamic Spectrum Plot Pipeline")
     print(f" Science: ON | MFS: {'ON' if INCLUDE_MFS else 'OFF'} | QC: {'ON' if INCLUDE_QC else 'OFF'}")
+    print(f" Check Local: {'ON' if CHECK_LOCAL_EXISTS else 'OFF (覆盖模式)'}")
+    if BATCH_PROCESS:
+        print(f" Workers: {MAX_WORKERS}")
     print("=" * 60)
 
     if BATCH_PROCESS:
-        print("Mode: BATCH")
-        ds_files = sorted(glob.glob(os.path.join(PIPELINE_RESULTS_DIR, "*.ds")))
-        if not ds_files:
+        # 优先递归扫描 */DS_Results/*.ds，兜底平面扫描 *.ds
+        all_ds = sorted(glob.glob(os.path.join(PIPELINE_RESULTS_DIR, "*", "DS_Results", "*.ds")))
+        if not all_ds:
+            all_ds = sorted(glob.glob(os.path.join(PIPELINE_RESULTS_DIR, "*.ds")))
+        if not all_ds:
             print(f" No .ds files found in: {PIPELINE_RESULTS_DIR}")
             return
-        print(f" Found {len(ds_files)} .ds files")
-        for ds_file in ds_files:
-            process_ds_file(ds_file, MASTER_OUTPUT_DIR)
+        print(f" Found {len(all_ds)} .ds files")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_ds_file, f, MASTER_OUTPUT_DIR): f for f in all_ds}
+            for future in as_completed(futures):
+                f = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"  [ERROR] {os.path.basename(f)}: {e}")
     else:
         print("Mode: SINGLE")
         if not os.path.exists(SINGLE_DS_FILE):
