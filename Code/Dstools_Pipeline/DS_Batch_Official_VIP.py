@@ -13,6 +13,7 @@ import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 warnings.filterwarnings('ignore')
 
 # --- 独立的 "VIP" 日志配置 (防止与主程序写冲突) ---
@@ -26,6 +27,21 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("ASKAP_Stellar_Pipeline_VIP")
+WARNED_PM_SOURCES = set()
+
+
+def get_proper_motion(star_meta, source_name):
+    pmra = star_meta.get('sy_pmra') if 'sy_pmra' in star_meta else star_meta.get('pmra')
+    pmdec = star_meta.get('sy_pmdec') if 'sy_pmdec' in star_meta else star_meta.get('pmdec')
+    missing = []
+    if pd.isna(pmra): missing.append('sy_pmra'); pmra = 0.0
+    if pd.isna(pmdec): missing.append('sy_pmdec'); pmdec = 0.0
+    warning = None
+    if missing:
+        warning = (f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing)}; "
+                   f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+                   "Epoch propagation continues without a complete reliable PM correction.")
+    return float(pmra), float(pmdec), warning
 
 
 # --- 路径与参数 ---
@@ -46,13 +62,13 @@ PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet
 
 #  VIP 控制面板
 # 在这里填入你想优先处理的高质量包的绝对路径
-VIP_TAR_FILES: List[str] = ['/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/Proxima_Cen/50381_scienceData.VAST_1453-62.SB50381.VAST_1453-62.beam33_averaged_cal.leakage.ms.tar'
+VIP_TAR_FILES: List[str] = ['/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/GJ_4274/36105_scienceData.RACS_2218-18.SB36105.RACS_2218-18.beam28_averaged_cal.leakage.ms.tar'
     # 示例: '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet/Downloading_Data/ms_data/GJ_4274/scienceData.VAST...beam00.ms.tar',
 ]
 
 MASK_RADIUS: int = 15  # 掩模半径（角秒）
-MAX_CONCURRENT_MS: int = 3  # VIP 通道的并发数量
-WSCLEAN_THREADS: int = 16  # VIP 专属分配的核心数
+MAX_CONCURRENT_MS: int = 1  # VIP 通道的并发数量
+WSCLEAN_THREADS: int = 8  # VIP 专属分配的核心数
 
 
 # --- 辅助函数 ---
@@ -115,10 +131,10 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
         return
 
     # 坐标计算逻辑
-    pmra_val = star_meta.get('sy_pmra', star_meta.get('pmra', 0.0))
-    pmdec_val = star_meta.get('sy_pmdec', star_meta.get('pmdec', 0.0))
-    pmra = 0.0 if pd.isna(pmra_val) else float(pmra_val)
-    pmdec = 0.0 if pd.isna(pmdec_val) else float(pmdec_val)
+    pmra, pmdec, pm_warning = get_proper_motion(star_meta, clean_hostname)
+    if pm_warning and clean_hostname not in WARNED_PM_SOURCES:
+        logger.warning(pm_warning)
+        WARNED_PM_SOURCES.add(clean_hostname)
     plx_val = star_meta.get('sy_plx', star_meta.get('plx', 10.0))
     plx = 10.0 if pd.isna(plx_val) or float(plx_val) <= 0 else float(plx_val)
 
@@ -145,6 +161,18 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
             os.path.join(workspace_dir, clean_ms_name)
         )
 
+        ms_path = os.path.join(workspace_dir, clean_ms_name)
+        if os.path.exists(os.path.join(ms_path, "FIELD_OLD")):
+            logger.warning(f" [重置] tar 包内 MS 含旧版预处理残留，彻底重置后重跑...")
+            run_cmd(f"fix_ms_dir --restore {clean_ms_name}", cwd=workspace_dir)
+            shutil.rmtree(os.path.join(ms_path, "FIELD_OLD"), ignore_errors=True)
+            shutil.rmtree(os.path.join(ms_path, "FEED_OLD"), ignore_errors=True)
+            import casacore.tables as _pt
+            _t = _pt.table(ms_path, readonly=False, ack=False)
+            if "CORRECTED_DATA" in _t.colnames():
+                _t.remove_cols("CORRECTED_DATA")
+                logger.info("  [重置] 已删除旧 CORRECTED_DATA 列")
+            _t.close()
         logger.info("执行预处理 (dstools-askap-preprocess)...")
         run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
 

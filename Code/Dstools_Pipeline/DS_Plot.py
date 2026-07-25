@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import h5py
 from dstools.dynamic_spectrum import DynamicSpectrum
 
+WARNED_PM_SOURCES = set()
+
 
 def project_path(relative_path: str) -> str:
     current = os.path.abspath(os.path.dirname(__file__))
@@ -33,19 +35,19 @@ def project_path(relative_path: str) -> str:
 # ==========================================
 # 配置区
 # ==========================================
-BATCH_PROCESS = False
-PIPELINE_RESULTS_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
-# SINGLE_DS_FILE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/Proxima_Cen/DS_Results/Proxima_Cen_SB50381_beam33.ds"
-SINGLE_DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Data/Ds/2MASS_J01033563-5515561_A/flare/2MASS_J01033563-5515561_A_SB59565_beam22.ds"
-# MASTER_OUTPUT_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/Dynamic Spectrum"
-MASTER_OUTPUT_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Result/Dynamic_Spectrum/2MASS_J01033563-5515561_A"
+BATCH_PROCESS = True
+PIPELINE_RESULTS_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/TOI-2992/DS_Results"
+SINGLE_DS_FILE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/2MASS_J01033563-5515561_A/DS_Results/2MASS_J01033563-5515561_A_SB68040_beam10.ds"
+# SINGLE_DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Data/Ds/2MASS_J01033563-5515561_A/flare/2MASS_J01033563-5515561_A_SB59565_beam22.ds"
+MASTER_OUTPUT_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/Dynamic Spectrum"
+# MASTER_OUTPUT_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Result/Dynamic_Spectrum/2MASS_J01033563-5515561_A"
 WSCLEAN_BASE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
-MAX_WORKERS = 4      # 批量模式并行线程数
+MAX_WORKERS = 5      # 批量模式并行线程数
 
 # 科学图参数
-I_LIMIT = 5
-V_LIMIT = 5
+I_LIMIT = 10
+V_LIMIT = 10
 TAVG_THRESHOLD_HOURS = 1.0   # 时长阈值（小时）
 TAVG_SHORT = 1               # < 阈值时用
 TAVG_LONG = 6                 # >= 阈值时用
@@ -57,15 +59,15 @@ POL_FRAC_LIMIT = 100  # |V|/I y轴上限 (%)
 TAVG_VI_FACTOR = 4   # V/I 光变曲线额外时间因子（长观测: 6×4=24, 短观测: 1×1=1）
 
 # MFS 图开关（画好后改成 False 省时间）
-INCLUDE_MFS = False    # True: 画 MFS 模型图; False: 跳过
+INCLUDE_MFS = True    # True: 画 MFS 模型图; False: 跳过
 INCLUDE_QC = True     # True: 画 QC 诊断图; False: 跳过
-CHECK_LOCAL_EXISTS = True   # True: 检测本地文件，已存在则跳过; False: 不检测直接覆盖
+CHECK_LOCAL_EXISTS = True     # True: 检测本地文件，已存在则跳过; False: 不检测直接覆盖
 
 COLOR_I = "black"
 COLOR_V = "#e74c3c"
 
 ASKAP_CATALOGUE_CSV = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
-INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_1.csv')
+INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
 
 
 # ==========================================
@@ -117,8 +119,16 @@ def get_target_coords(hostname, sbid):
     if not obs_mjd:
         return None, None
 
-    pmra = 0.0 if pd.isna(star_meta.get('sy_pmra', star_meta.get('pmra', 0.0))) else float(star_meta.get('sy_pmra', star_meta.get('pmra', 0.0)))
-    pmdec = 0.0 if pd.isna(star_meta.get('sy_pmdec', star_meta.get('pmdec', 0.0))) else float(star_meta.get('sy_pmdec', star_meta.get('pmdec', 0.0)))
+    pmra = star_meta.get('sy_pmra') if 'sy_pmra' in star_meta else star_meta.get('pmra')
+    pmdec = star_meta.get('sy_pmdec') if 'sy_pmdec' in star_meta else star_meta.get('pmdec')
+    missing_pm = []
+    if pd.isna(pmra): missing_pm.append('sy_pmra'); pmra = 0.0
+    if pd.isna(pmdec): missing_pm.append('sy_pmdec'); pmdec = 0.0
+    if missing_pm and matched_key not in WARNED_PM_SOURCES:
+        print(f"⚠️ [NO PROPER MOTION] {matched_key}: missing {', '.join(missing_pm)}; "
+              f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+              "Epoch propagation continues without a complete reliable PM correction.")
+        WARNED_PM_SOURCES.add(matched_key)
     plx_val = star_meta.get('sy_plx', star_meta.get('plx', 10.0))
     plx = 10.0 if pd.isna(plx_val) or float(plx_val) <= 0 else float(plx_val)
 

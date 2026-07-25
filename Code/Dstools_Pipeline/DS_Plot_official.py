@@ -24,8 +24,8 @@ def project_path(relative_path: str) -> str:
 PIPELINE_RESULTS_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/HD_180902'
 
 # 图像输出的全局根目录 (按源建立“画廊”)
-MASTER_OUTPUT_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/Dynamic_Spectrum'
-
+# MASTER_OUTPUT_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/Dynamic_Spectrum'
+MASTER_OUTPUT_DIR = '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/Dynamic Spectrum'
 
 # 控制面板
 # 批量处理开关
@@ -34,13 +34,13 @@ MASTER_OUTPUT_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Re
 BATCH_PROCESS = False
 
 # 如果关闭了批量处理 (设为False)，请在这里填入你要单独出图的那个 .ds 文件的相对/绝对位置
-SINGLE_DS_FILE = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/2MASS_J01033563-5515561_A/2MASS_J01033563-5515561_A_SB59565_beam22.ds'
+SINGLE_DS_FILE = '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/2MASS_J01033563-5515561_A/DS_Result/2MASS_J01033563-5515561_A_SB59565_beam22.ds'
 
 # 绘图参数
 T_AVG = 12    # 时间平均因子
 F_AVG = 5    # 频率平均因子
-I_LIMIT = 5  # Stokes I 辐射通量范围上限 (mJy)
-V_LIMIT = 5  # Stokes V 辐射通量范围上限 (mJy)
+I_LIMIT = 8  # Stokes I 辐射通量范围上限 (mJy)
+V_LIMIT = 8  # Stokes V 辐射通量范围上限 (mJy)
 
 
 def run_official_and_force_save(args, output_prefix):

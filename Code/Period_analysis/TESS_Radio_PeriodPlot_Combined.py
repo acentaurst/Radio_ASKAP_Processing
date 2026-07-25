@@ -18,7 +18,7 @@ from dstools.dynamic_spectrum import DynamicSpectrum
 PERIOD = 0.1664  # 折叠周期 (天)
 
 # DS 文件路径
-DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/2MASS_J01033563-5515561_A/2MASS_J01033563-5515561_A_SB59565_beam22.ds"
+DS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/2MASS_J01033563-5515561_A/Flare/2MASS_J01033563-5515561_A_SB68040_beam10.ds"
 
 # TESS FITS 文件路径 (手动选择)
 TESS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_localbin/Data/TESS_Data/2MASS_J01033563-5515561_A/Sector_00/mastDownload/HLSP/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc.fits"

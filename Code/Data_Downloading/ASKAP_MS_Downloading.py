@@ -37,11 +37,11 @@ OPAL_USER = "acentauri_huangst@163.com"
 
 # 路径配置
 CASDA_BASE_PATH = '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data'
-INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
+INPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct.csv')
 FAILED_LIST_PATH = os.path.join(os.path.dirname(CASDA_BASE_PATH), '0.failed_ms_downloads_log.csv')
 
 # ————————————————— 核心控制参数 —————————————————
-TARGET_SOURCES = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 229','GJ 896 A','GJ 3323','GJ 4274','HD 180902','HD 41004 A','HD 95086','Proxima Cen','PZ Tel','ROXs 42 B','TOI-2992','TOI-2458']
+TARGET_SOURCES = ['2MASS J01033563-5515561 A']
 MAX_RETRIES = 3
 BATCH_SIZE = 15  # 每次最多向服务器请求的文件数量，避免 414 URI Too Long
 
@@ -68,11 +68,6 @@ try:
             print(" 在 CSV 文件中未找到您指定的特定源，请检查名称是否匹配。程序已退出。")
             exit()
 
-    for col in ['sy_pmra', 'sy_pmdec']:
-        if col not in valid_df.columns:
-            valid_df[col] = 0.0
-        valid_df[col] = valid_df[col].fillna(0.0)
-
     source_list = valid_df.to_dict('records')
     print(f"成功解析 CSV。共提取 {len(source_list)} 个独立源，准备执行全历元检索。")
 except Exception as e:
@@ -87,11 +82,21 @@ def process_source(src):
     os.makedirs(source_dir, exist_ok=True)
 
     # 建立星表的基础坐标基准 (固定为 J2015.5)
+    pmra = src.get('sy_pmra') if 'sy_pmra' in src else src.get('pmra')
+    pmdec = src.get('sy_pmdec') if 'sy_pmdec' in src else src.get('pmdec')
+    missing = []
+    if pd.isna(pmra): missing.append('sy_pmra'); pmra = 0.0
+    if pd.isna(pmdec): missing.append('sy_pmdec'); pmdec = 0.0
+    if missing:
+        tqdm.write(f"⚠️ [NO PROPER MOTION] {src['hostname']}: missing {', '.join(missing)}; "
+                   f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+                   "Epoch propagation continues without a complete reliable PM correction.")
+
     source_coords = SkyCoord(
         ra=src['ra'] * un.deg,
         dec=src['dec'] * un.deg,
-        pm_ra_cosdec=src['sy_pmra'] * un.mas / un.yr,
-        pm_dec=src['sy_pmdec'] * un.mas / un.yr,
+        pm_ra_cosdec=float(pmra) * un.mas / un.yr,
+        pm_dec=float(pmdec) * un.mas / un.yr,
         frame='icrs',
         obstime=Time('J2015.5'),
         distance=100 * un.pc

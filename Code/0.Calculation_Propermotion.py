@@ -22,6 +22,16 @@ def calculate_new_epoch_coordinates(ra, dec, pm_ra_cosdec, pm_dec, initial_epoch
     SkyCoord: 计算自行后在目标 MJD 历元下的坐标对象
     """
 
+    try:
+        pmra = float(pm_ra_cosdec)
+        pmdec = float(pm_dec)
+        if not (float('-inf') < pmra < float('inf') and float('-inf') < pmdec < float('inf')):
+            raise ValueError
+    except (TypeError, ValueError):
+        print('⚠️ [NO PROPER MOTION] coordinate calculation: missing proper-motion information; '
+              'using pmra=0.000, pmdec=0.000 mas/yr. Epoch propagation continues without a reliable PM correction.')
+        pmra, pmdec = 0.0, 0.0
+
     # 1. 解析初始历元和目标 MJD
     obstime_initial = Time(initial_epoch)
     obstime_target = Time(target_mjd, format='mjd')
@@ -30,8 +40,8 @@ def calculate_new_epoch_coordinates(ra, dec, pm_ra_cosdec, pm_dec, initial_epoch
     coord_kwargs = {
         'ra': ra * u.deg,
         'dec': dec * u.deg,
-        'pm_ra_cosdec': pm_ra_cosdec * u.mas / u.yr,
-        'pm_dec': pm_dec * u.mas / u.yr,
+        'pm_ra_cosdec': pmra * u.mas / u.yr,
+        'pm_dec': pmdec * u.mas / u.yr,
         'frame': 'icrs',
         'obstime': obstime_initial
     }

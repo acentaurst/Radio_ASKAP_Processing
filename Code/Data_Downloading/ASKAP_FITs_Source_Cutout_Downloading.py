@@ -4,9 +4,13 @@ import os
 import glob
 import time
 import keyring
+import tempfile
 from astropy.coordinates import SkyCoord
 import astropy.units as un
 from astropy.time import Time
+from astropy.io import fits
+from astropy.nddata import Cutout2D
+from astropy.wcs import WCS
 from astroquery.casda import Casda
 from astroquery.utils.tap.core import TapPlus
 from astropy.table import Table
@@ -35,7 +39,96 @@ def project_path(relative_path):
 MAX_RETRIES = 3  # 全局/局部最大重试次数
 MIN_FILE_SIZE = 10 * 1024  # 验证下载完整性的最小文件大小 (10KB)
 CUTOUT_WIDTH = 60 * un.arcsec
+TARGET_SOURCES = []  # 留空处理全部源；填写 hostname 精确名称可只处理指定源
 # ————————————————————————————————————————————————
+
+
+def select_target_sources(stars, target_sources):
+    unique_stars = stars.drop_duplicates(subset=['hostname']).reset_index(drop=True)
+    if not target_sources:
+        return unique_stars
+    requested = list(dict.fromkeys(target_sources))
+    available = set(unique_stars['hostname'])
+    missing = [name for name in requested if name not in available]
+    if missing:
+        raise ValueError(f"TARGET_SOURCES 中未找到以下 hostname: {missing}")
+    return (
+        unique_stars[unique_stars['hostname'].isin(requested)]
+        .set_index('hostname')
+        .loc[requested]
+        .reset_index()
+    )
+
+
+def create_local_cutout(full_image_path, output_path, coordinates, radius,
+                        min_file_size=MIN_FILE_SIZE):
+    output_path = os.fspath(output_path)
+    temporary_output = f"{output_path}.part"
+    try:
+        with fits.open(full_image_path, memmap=True) as hdul:
+            image_data = np.squeeze(hdul[0].data)
+            if image_data.ndim != 2:
+                raise ValueError(
+                    f"完整 FITS 压缩单元素轴后仍为 {image_data.ndim} 维，无法安全截取二维图像"
+                )
+            header = hdul[0].header.copy()
+            input_wcs = WCS(header)
+            cutout = Cutout2D(
+                image_data,
+                position=coordinates,
+                size=(2 * radius, 2 * radius),
+                wcs=input_wcs.celestial,
+                mode='strict',
+            )
+            for keyword in input_wcs.to_header(relax=True):
+                header.remove(keyword, ignore_missing=True, remove_all=True)
+            header.update(cutout.wcs.to_header(relax=True))
+            fits.PrimaryHDU(data=cutout.data, header=header).writeto(
+                temporary_output,
+                overwrite=True,
+            )
+        if os.path.getsize(temporary_output) <= min_file_size:
+            raise ValueError(
+                f"本地 cutout 文件大小不足 {min_file_size} bytes，可能不完整"
+            )
+        os.replace(temporary_output, output_path)
+        return output_path
+    finally:
+        if os.path.exists(temporary_output):
+            os.remove(temporary_output)
+
+
+def download_full_image_and_create_cutout(
+        casda_client, product_table, expected_filename, output_path,
+        coordinates, radius, temp_parent, min_file_size=MIN_FILE_SIZE):
+    with tempfile.TemporaryDirectory(
+            prefix='.full_image_', dir=os.fspath(temp_parent)) as temp_dir:
+        url_list = casda_client.stage_data(product_table)
+        if not url_list:
+            raise RuntimeError("Staging 失败，未返回完整 FITS 下载链接")
+        downloaded_files = casda_client.download_files(url_list, savedir=temp_dir)
+        if not downloaded_files:
+            raise RuntimeError("完整 FITS 下载返回空文件列表")
+
+        expected_basename = os.path.basename(str(expected_filename))
+        full_image_path = next(
+            (
+                path for path in downloaded_files
+                if os.path.basename(os.fspath(path)) == expected_basename
+            ),
+            None,
+        )
+        if full_image_path is None:
+            raise RuntimeError(
+                f"下载结果中未找到预期完整 FITS: {expected_basename}"
+            )
+        return create_local_cutout(
+            full_image_path,
+            output_path,
+            coordinates,
+            radius,
+            min_file_size=min_file_size,
+        )
 
 # 1. CASDA 账号配置
 try:
@@ -51,15 +144,18 @@ casda.login(username=OPAL_USER, store_password=True)
 time_info_file = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
 Time_info = pd.read_csv(time_info_file)
 
-star_catalog_file = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_1.csv')
+star_catalog_file = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct.csv')
 star_df = pd.read_csv(star_catalog_file)
-star_df = star_df.drop_duplicates(subset=['hostname']).reset_index(drop=True)
+star_df = select_target_sources(star_df, TARGET_SOURCES)
 
-print(f"共有 {len(star_df)} 个独立的恒星源准备进行切片下载。")
+if TARGET_SOURCES:
+    print(f"指定源模式：仅处理 {star_df['hostname'].tolist()}")
+else:
+    print(f"共有 {len(star_df)} 个独立的恒星源准备进行切片下载。")
 
 # 2.5 优先级排序区
-priority_list = ['AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 229','GJ 896 A','GJ 3323','HD 41004 A']
-if priority_list:
+priority_list = ['2MASS J01033563-5515561 A']
+if priority_list and not TARGET_SOURCES:
     star_df['priority'] = star_df['hostname'].apply(lambda x: 0 if x in priority_list else 1)
     star_df = star_df.sort_values('priority').drop(columns=['priority']).reset_index(drop=True)
     print(f"已调整优先级：将优先处理 {priority_list}，随后处理剩余源。")
@@ -67,17 +163,32 @@ if priority_list:
 download_base_dir = '/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Fits_image'
 failed_downloads = []
 
+
+def get_proper_motion(star, source_name):
+    pmra = star.get('sy_pmra') if 'sy_pmra' in star else star.get('pmra')
+    pmdec = star.get('sy_pmdec') if 'sy_pmdec' in star else star.get('pmdec')
+    missing = []
+    if pd.isna(pmra): missing.append('sy_pmra'); pmra = 0.0
+    if pd.isna(pmdec): missing.append('sy_pmdec'); pmdec = 0.0
+    if missing:
+        print(f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing)}; "
+              f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+              "Epoch propagation continues without a complete reliable PM correction.")
+    return float(pmra), float(pmdec)
+
 # 3. 下载循环
 for index, Star in star_df.iterrows():
     hostname = Star['hostname']
     safe_hostname = str(hostname).replace(" ", "_")
     print(f"\n[{index + 1}/{len(star_df)}] 正在处理目标源: {hostname}")
 
+    pmra, pmdec = get_proper_motion(Star, str(hostname))
+
     source_coords = SkyCoord(
         ra=Star['ra'] * un.deg,
         dec=Star['dec'] * un.deg,
-        pm_ra_cosdec=Star['sy_pmra'] * un.mas / un.yr,
-        pm_dec=Star['sy_pmdec'] * un.mas / un.yr,
+        pm_ra_cosdec=pmra * un.mas / un.yr,
+        pm_dec=pmdec * un.mas / un.yr,
         frame='icrs',
         obstime=Time('J2015.5'),
         distance=100 * un.pc
@@ -183,38 +294,32 @@ for index, Star in star_df.iterrows():
 
             # 3. 单次切片任务的局部重试循环
             url_info_df = Table.from_pandas(pd.DataFrame([best_row]))
+            original_basename = os.path.basename(str(best_row['filename']))
+            new_basename = (
+                f"{safe_hostname}_{sbid_full}_Stokes{stokes_param}_"
+                f"{original_basename}"
+            )
+            new_filepath = os.path.join(cutout_path, new_basename)
             batch_success = False
             batch_err_msg = ""
 
             for inner_attempt in range(MAX_RETRIES):
                 try:
-                    # 每次循环都保证切割坐标基于当前的 PM 动态算好
-                    url_list = casda.cutout(url_info_df, coordinates=pm_coords, radius=CUTOUT_WIDTH)
-                    if not url_list:
-                        raise Exception("Cutout 返回空链接")
-
-                    filelist = casda.download_files(url_list, savedir=cutout_path)
-
-                    if filelist:
-                        for downloaded_file in filelist:
-                            orig_basename = os.path.basename(downloaded_file)
-                            new_basename = f"{safe_hostname}_{sbid_full}_Stokes{stokes_param}_{orig_basename}"
-                            new_filepath = os.path.join(cutout_path, new_basename)
-
-                            if os.path.exists(new_filepath):
-                                os.remove(new_filepath)
-                            os.rename(downloaded_file, new_filepath)
-
-                            # 确认下载并非产生空壳文件
-                            if os.path.getsize(new_filepath) > MIN_FILE_SIZE:
-                                print(f"  -> [成功下载] 匹配 {sbid_full}, 保存为 {new_basename}")
-                                batch_success = True
-                            else:
-                                os.remove(new_filepath)
-                                raise Exception("文件大小不足 10KB，可能损坏或仅包含 header，触发重试")
-
-                    if batch_success:
-                        break  # 成功跳出局部重试
+                    download_full_image_and_create_cutout(
+                        casda_client=casda,
+                        product_table=url_info_df,
+                        expected_filename=best_row['filename'],
+                        output_path=new_filepath,
+                        coordinates=pm_coords,
+                        radius=CUTOUT_WIDTH,
+                        temp_parent=cutout_path,
+                    )
+                    print(
+                        f"  -> [成功截取] 匹配 {sbid_full}, 保存为 {new_basename}; "
+                        "完整 FITS 已清理"
+                    )
+                    batch_success = True
+                    break
 
                 except Exception as inner_e:
                     batch_err_msg = str(inner_e)

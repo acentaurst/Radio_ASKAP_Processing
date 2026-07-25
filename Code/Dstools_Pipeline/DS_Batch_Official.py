@@ -26,6 +26,21 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("ASKAP_Stellar_Pipeline_Official")
+WARNED_PM_SOURCES = set()
+
+
+def get_proper_motion(star_meta, source_name):
+    pmra = star_meta.get('sy_pmra') if 'sy_pmra' in star_meta else star_meta.get('pmra')
+    pmdec = star_meta.get('sy_pmdec') if 'sy_pmdec' in star_meta else star_meta.get('pmdec')
+    missing = []
+    if pd.isna(pmra): missing.append('sy_pmra'); pmra = 0.0
+    if pd.isna(pmdec): missing.append('sy_pmdec'); pmdec = 0.0
+    warning = None
+    if missing:
+        warning = (f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing)}; "
+                   f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+                   "Epoch propagation continues without a complete reliable PM correction.")
+    return float(pmra), float(pmdec), warning
 
 
 # --- 路径与参数 ---
@@ -41,13 +56,13 @@ def project_path(relative_path: str) -> str:
 
 
 ASKAP_CATALOGUE_CSV: str = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
-INPUT_CSV: str = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_1.csv')
+INPUT_CSV: str = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
 
 CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data"
 PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
 # --- 控制参数 ---
-TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel']
+TARGET_SOURCES: List[str] = ['2MASS J01033563-5515561 A','AB Pic','AF Lep','AU Mic', 'COCONUTS-2 A','GJ 896 A','GJ 4274','HD 180902','HD 95086','Proxima Cen','PZ Tel','GJ 229','GJ 3323','HD 41004 A','ROXs 42 B','TOI-2992','TOI-2458']
 MASK_RADIUS: int = 15     # 掩模半径（角秒）
 MAX_CONCURRENT_MS: int = 7     # 同时并行处理的 MS 压缩包数量
 WSCLEAN_THREADS: int = 8     # 每个 WSClean 进程分配的线程数
@@ -117,10 +132,10 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
         return
 
     # 坐标计算逻辑
-    pmra_val = star_meta.get('sy_pmra', star_meta.get('pmra', 0.0))
-    pmdec_val = star_meta.get('sy_pmdec', star_meta.get('pmdec', 0.0))
-    pmra = 0.0 if pd.isna(pmra_val) else float(pmra_val)
-    pmdec = 0.0 if pd.isna(pmdec_val) else float(pmdec_val)
+    pmra, pmdec, pm_warning = get_proper_motion(star_meta, clean_hostname)
+    if pm_warning and clean_hostname not in WARNED_PM_SOURCES:
+        logger.warning(pm_warning)
+        WARNED_PM_SOURCES.add(clean_hostname)
 
     plx_val = star_meta.get('sy_plx', star_meta.get('plx', 10.0))
     plx = 10.0 if pd.isna(plx_val) or float(plx_val) <= 0 else float(plx_val)

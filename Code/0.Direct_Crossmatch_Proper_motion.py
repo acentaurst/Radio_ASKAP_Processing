@@ -29,7 +29,7 @@ def project_path(relative_path):
 # --- 1. 配置文件路径 ---
 XML_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/ASKAP_Catalogue'
 ASKAP_CATALOGUE_CSV = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
-FINAL_OUTPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
+FINAL_OUTPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct.csv')
 
 # 你的原始恒星表
 STAR_CATALOG_CSV = project_path('Processed_Data/Catalogue/PS_2026.03.17_23.38.02.csv')
@@ -45,6 +45,25 @@ def extract_sbid_robust(text):
     digit_match = re.search(r'(\d+)', text)
     if digit_match: return str(int(digit_match.group(1)))
     return None
+
+
+def get_proper_motion(record, source_name):
+    """Return PM components and a warning when the catalogue lacks either one."""
+    pmra_value = record.get('sy_pmra') if 'sy_pmra' in record else record.get('pmra')
+    pmdec_value = record.get('sy_pmdec') if 'sy_pmdec' in record else record.get('pmdec')
+    missing = []
+    if pd.isna(pmra_value):
+        missing.append('sy_pmra')
+        pmra_value = 0.0
+    if pd.isna(pmdec_value):
+        missing.append('sy_pmdec')
+        pmdec_value = 0.0
+    warning = None
+    if missing:
+        warning = (f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing)}; "
+                   f"using pmra={float(pmra_value):.3f}, pmdec={float(pmdec_value):.3f} mas/yr. "
+                   "Epoch propagation continues without a complete reliable PM correction.")
+    return float(pmra_value), float(pmdec_value), not missing, warning
 
 
 def run_final_pipeline():
@@ -65,8 +84,21 @@ def run_final_pipeline():
         return
 
     print(f" 读取恒星星表: {STAR_CATALOG_CSV}")
-    stars_df = pd.read_csv(STAR_CATALOG_CSV)
-    stars_df.columns = stars_df.columns.str.strip()
+    stars_raw_df = pd.read_csv(STAR_CATALOG_CSV)
+    stars_raw_df.columns = stars_raw_df.columns.str.strip()
+
+    pmra_missing = stars_raw_df['sy_pmra'].isna() if 'sy_pmra' in stars_raw_df else stars_raw_df.get('pmra', pd.Series(np.nan, index=stars_raw_df.index)).isna()
+    pmdec_missing = stars_raw_df['sy_pmdec'].isna() if 'sy_pmdec' in stars_raw_df else stars_raw_df.get('pmdec', pd.Series(np.nan, index=stars_raw_df.index)).isna()
+    missing_pm_df = stars_raw_df.loc[pmra_missing | pmdec_missing].copy()
+    catalog_stem, catalog_suffix = os.path.splitext(STAR_CATALOG_CSV)
+    missing_pm_output = f"{catalog_stem}_missing_proper_motion{catalog_suffix or '.csv'}"
+    missing_pm_df.to_csv(missing_pm_output, index=False)
+    print(
+        f"⚠️ [NO PROPER MOTION] 在原始 PS 星表中发现 {len(missing_pm_df)} 条"
+        f"自行信息不完整的记录；已完整导出至: {missing_pm_output}"
+    )
+
+    stars_df = stars_raw_df.copy()
 
     # 优先保留 NASA 官方推荐的参数行
     if 'default_flag' in stars_df.columns:
@@ -75,10 +107,16 @@ def run_final_pipeline():
     # 剔除坐标为空的无效数据
     stars_df = stars_df.dropna(subset=['ra', 'dec']).reset_index(drop=True)
 
-    pmra = stars_df['sy_pmra'].fillna(0.0).to_numpy(copy=True)
-    pmdec = stars_df['sy_pmdec'].fillna(0.0).to_numpy(copy=True)
-    # pmra = stars_df['pmra'].fillna(0.0).to_numpy(copy=True)
-    # pmdec = stars_df['pmdec'].fillna(0.0).to_numpy(copy=True)
+    pm_infos = [
+        get_proper_motion(star_row, str(star_row.get('hostname', index)))
+        for index, star_row in stars_df.iterrows()
+    ]
+    for _, _, _, pm_warning in pm_infos:
+        if pm_warning:
+            tqdm.write(pm_warning)
+
+    pmra = np.array([pm_info[0] for pm_info in pm_infos])
+    pmdec = np.array([pm_info[1] for pm_info in pm_infos])
     plx = stars_df['sy_plx'].fillna(1.0).to_numpy(copy=True)
     plx[plx <= 0] = 1.0
 
@@ -157,6 +195,9 @@ def run_final_pipeline():
             merged_info['obs_mjd'] = mjd_val
             merged_info['obs_decimalyear'] = round(obs_time.decimalyear, 4)
             merged_info['true_sep_arcsec'] = round(d2d[i_star].arcsec, 4)
+            merged_info['proper_motion_applied'] = pm_infos[i_star][2]
+            merged_info['proper_motion_note'] = ('proper motion applied' if pm_infos[i_star][2]
+                                                  else 'missing proper motion; zero-PM fallback')
 
             final_candidates.append(merged_info)
 

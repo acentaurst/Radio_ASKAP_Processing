@@ -1,7 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""多历元相位折叠对比：TESS + 多个 SBID 的射电数据按同一周期折叠，TESS 在最上方对齐。"""
-
 import os
 import re
 import sys
@@ -31,18 +27,18 @@ def project_path(relative_path: str) -> str:
 # 配置区
 # ============================================================
 PERIOD_DAYS = 0.1664       # 折叠周期（天）
-BIN_SEC = 120               # 时间分箱（秒）
+BIN_SEC = 60               # 时间分箱（秒）
 XLO, XHI = 0.0, 2.0        # 双周期显示
 
 # ── TESS ──
-TESS_FILE = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data/2MASS_J01033563-5515561_A/Sector_00/mastDownload/HLSP/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc.fits"
+# TESS_FILE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/TESS_Data/2MASS_J01033563-5515561_A/Sector_00/mastDownload/HLSP/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc/hlsp_qlp_tess_ffi_s0069-0000000616014335_tess_v01_llc.fits"
 INCLUDE_TESS = True         # 是否在顶部加入 TESS 相位折叠面板
 
 # ── 射电 DS ──
 DS_FILES = [
 ]
 BATCH_PROCESS = True
-DS_FILES_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/Proxima_Cen/DS_Results"
+DS_FILES_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS/2MASS_J01033563-5515561_A/DS_Results"
 SOURCE_FILTER = ""
 
 OUTPUT_BASE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/Epoch_Comparison"

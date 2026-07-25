@@ -13,13 +13,13 @@ import matplotlib.pyplot as plt
 # ======================================================================
 #  排查方案：改下面参数，每改完一次跑脚本即生成一个对比数据点
 # ======================================================================
-TAR_PATH = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/Proxima_Cen/50381_scienceData.VAST_1453-62.SB50381.VAST_1453-62.beam33_averaged_cal.leakage.ms.tar"
+TAR_PATH = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data/GJ_4274/36105_scienceData.RACS_2218-18.SB36105.RACS_2218-18.beam28_averaged_cal.leakage.ms.tar"
 
 # ── 数据处理开关 ──
-DO_PREPROCESS = True            # 是否执行 dstools-askap-preprocess
+DO_PREPROCESS = False            # 是否执行 dstools-askap-preprocess
+PREPROCESS_MODE = "skip"       # "reset": tar含旧预处理残留时重置+重跑 | "skip": 跳过(复现横纹)
 DO_INSERT = True                # 是否执行 dstools-insert-model
 DO_SUBTRACT = True              # 是否执行 dstools-subtract-model
-PREDICT_AFTER = False           # insert-model 后额外跑 wsclean -predict
 DATACOLUMN = "data"             # 提取来源: "data" / "corrected"
 EXTRACT_FROM = "subtracted"     # 提取对象: "subtracted" / "clean"
 
@@ -191,10 +191,15 @@ for k in star_catalog_dict.keys():
 clean_hostname = matched_key
 star_meta = star_catalog_dict[clean_hostname]
 
-pmra_val = star_meta.get('sy_pmra', star_meta.get('pmra', 0.0))
-pmdec_val = star_meta.get('sy_pmdec', star_meta.get('pmdec', 0.0))
-pmra = 0.0 if pd.isna(pmra_val) else float(pmra_val)
-pmdec = 0.0 if pd.isna(pmdec_val) else float(pmdec_val)
+pmra = star_meta.get('sy_pmra') if 'sy_pmra' in star_meta else star_meta.get('pmra')
+pmdec = star_meta.get('sy_pmdec') if 'sy_pmdec' in star_meta else star_meta.get('pmdec')
+missing_pm = []
+if pd.isna(pmra): missing_pm.append('sy_pmra'); pmra = 0.0
+if pd.isna(pmdec): missing_pm.append('sy_pmdec'); pmdec = 0.0
+if missing_pm:
+    print(f"⚠️ [NO PROPER MOTION] {clean_hostname}: missing {', '.join(missing_pm)}; "
+          f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+          "Epoch propagation continues without a complete reliable PM correction.")
 plx_val = star_meta.get('sy_plx', star_meta.get('plx', 10.0))
 plx = 10.0 if pd.isna(plx_val) or float(plx_val) <= 0 else float(plx_val)
 
@@ -225,7 +230,6 @@ tag_parts = []
 if not DO_PREPROCESS: tag_parts.append("nopre")
 if not DO_INSERT: tag_parts.append("noins")
 if not DO_SUBTRACT: tag_parts.append("nosub")
-if PREDICT_AFTER: tag_parts.append("pred")
 tag_parts.append(f"col{DATACOLUMN}")
 tag_parts.append(f"from{EXTRACT_FROM}")
 tag_parts.append(f"uv{MINUVDIST}" if MINUVDIST > 0 else "uv0")
@@ -238,7 +242,7 @@ wsclean_model_dir_name = f"wsclean_model_{clean_hostname}_SB{sbid}_beam{beam}"
 
 print("=" * 60)
 print(f" 诊断方案: {tag}")
-print(f" PREPROCESS={DO_PREPROCESS} INSERT={DO_INSERT} SUBTRACT={DO_SUBTRACT} PREDICT={PREDICT_AFTER}")
+print(f" PREPROCESS={DO_PREPROCESS} INSERT={DO_INSERT} SUBTRACT={DO_SUBTRACT}")
 print(f" DATACOLUMN={DATACOLUMN} EXTRACT_FROM={EXTRACT_FROM}")
 print(f" MINUVDIST={MINUVDIST} BASELINE={BASELINE_AVERAGE} MASK_RADIUS={MASK_RADIUS}")
 print("=" * 60)
@@ -257,16 +261,29 @@ with tarfile.open(TAR_PATH, 'r') as tar:
 os.rename(os.path.join(workspace_dir, extracted_folder_name), os.path.join(workspace_dir, clean_ms_name))
 
 if DO_PREPROCESS:
-    run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
+    ms_path = os.path.join(workspace_dir, clean_ms_name)
+    if os.path.exists(os.path.join(ms_path, "FIELD_OLD")):
+        if PREPROCESS_MODE == "reset":
+            print("  [重置] tar 包内 MS 含旧版预处理残留，彻底重置后重跑...")
+            run_cmd(f"fix_ms_dir --restore {clean_ms_name}", cwd=workspace_dir)
+            shutil.rmtree(os.path.join(ms_path, "FIELD_OLD"), ignore_errors=True)
+            shutil.rmtree(os.path.join(ms_path, "FEED_OLD"), ignore_errors=True)
+            t = pt.table(ms_path, readonly=False, ack=False)
+            if "CORRECTED_DATA" in t.colnames():
+                t.remove_cols("CORRECTED_DATA")
+                print("  [重置] 已删除旧 CORRECTED_DATA 列")
+            t.close()
+            run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
+        elif PREPROCESS_MODE == "skip":
+            print("  [跳过] tar 包内 MS 已含 FIELD_OLD，跳过预处理（复现横纹）")
+        else:
+            raise RuntimeError(f"tar 含 FIELD_OLD 但 PREPROCESS_MODE='{PREPROCESS_MODE}' 不是 reset/skip")
+    else:
+        run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
 
 if DO_INSERT:
     run_cmd(
         f"dstools-insert-model -p {corr_ra} {corr_dec} -r {MASK_RADIUS} {wsclean_model_dir_name} {clean_ms_name}",
-        cwd=workspace_dir)
-
-if DO_INSERT and PREDICT_AFTER:
-    run_cmd(
-        f"wsclean -predict -name {wsclean_model_dir_name}/wsclean -channels-out 8 -pol iv {clean_ms_name}",
         cwd=workspace_dir)
 
 if DO_SUBTRACT:
@@ -324,5 +341,5 @@ if APPLY_LEAKAGE_CORRECTION:
 # 自动画图
 print("\n绘图...")
 run_cmd(
-    f"dstools-plot-ds -d {ds_out} -l -s IV -t 6 -f 8",
+    f"dstools-plot-ds -d {ds_out} -l -s IV -t 1 -f 5",
     cwd=ds_results_dir)

@@ -26,6 +26,21 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("ASKAP_Stellar_Pipeline")
+WARNED_PM_SOURCES = set()
+
+
+def get_proper_motion(star_meta, source_name):
+    pmra = star_meta.get('sy_pmra') if 'sy_pmra' in star_meta else star_meta.get('pmra')
+    pmdec = star_meta.get('sy_pmdec') if 'sy_pmdec' in star_meta else star_meta.get('pmdec')
+    missing = []
+    if pd.isna(pmra): missing.append('sy_pmra'); pmra = 0.0
+    if pd.isna(pmdec): missing.append('sy_pmdec'); pmdec = 0.0
+    warning = None
+    if missing:
+        warning = (f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing)}; "
+                   f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+                   "Epoch propagation continues without a complete reliable PM correction.")
+    return float(pmra), float(pmdec), warning
 
 
 # --- 路径与参数 ---
@@ -120,10 +135,10 @@ def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, 
         return
 
     # 坐标计算逻辑
-    pmra_val = star_meta.get('sy_pmra', star_meta.get('pmra', 0.0))
-    pmdec_val = star_meta.get('sy_pmdec', star_meta.get('pmdec', 0.0))
-    pmra = 0.0 if pd.isna(pmra_val) else float(pmra_val)
-    pmdec = 0.0 if pd.isna(pmdec_val) else float(pmdec_val)
+    pmra, pmdec, pm_warning = get_proper_motion(star_meta, clean_hostname)
+    if pm_warning and clean_hostname not in WARNED_PM_SOURCES:
+        logger.warning(pm_warning)
+        WARNED_PM_SOURCES.add(clean_hostname)
 
     plx_val = star_meta.get('sy_plx', star_meta.get('plx', 10.0))
     plx = 10.0 if pd.isna(plx_val) or float(plx_val) <= 0 else float(plx_val)

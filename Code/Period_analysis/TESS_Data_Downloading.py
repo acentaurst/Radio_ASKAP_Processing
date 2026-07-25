@@ -13,8 +13,9 @@ from tqdm.auto import tqdm
 # ========================
 # 配置：修改这里的默认值
 # ========================
-DEFAULT_TARGETS = ["GJ 4274","COCONUTS-2 A","GJ 896 A","HD 95086"]
-DEFAULT_DOWNLOAD_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data"
+DEFAULT_TARGETS = ["2MASS J01033563-5515561 A"]
+# DEFAULT_DOWNLOAD_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data"
+DEFAULT_DOWNLOAD_DIR = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/TESS_Data"
 DEFAULT_TYPE = "all"
 
 SUFFIX_MAP = {
