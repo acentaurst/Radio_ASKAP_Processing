@@ -1,3 +1,5 @@
+"""Invoke the official DStools plotting workflow and collect its saved figures."""
+
 import sys
 import os
 import shutil
@@ -7,17 +9,10 @@ import glob
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 # 路径与参数
-def project_path(relative_path: str) -> str:
-    """自适应项目根目录定位"""
-    current = os.path.abspath(os.path.dirname(__file__))
-    while not (os.path.isdir(os.path.join(current, 'Code')) and os.path.isdir(os.path.join(current, 'Processed_Data'))):
-        parent = os.path.dirname(current)
-        if parent == current:
-            return os.path.join(os.getcwd(), relative_path)
-        current = parent
-    return os.path.join(current, relative_path)
+
 
 
 # 管线产生 .ds 成果的目录
@@ -147,7 +142,7 @@ def process_ds_file(ds_file, output_dir):
     run_official_and_force_save(args_combined, out_prefix)
 
 
-def main():
+def main() -> None:
     print("======================================================")
     print(" 🎨 ASKAP 官方画图管线")
     print("======================================================")

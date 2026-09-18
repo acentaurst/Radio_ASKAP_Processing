@@ -1,3 +1,5 @@
+"""Remove recoverable WSClean intermediates after verifying final dynamic-spectrum products."""
+
 import os
 import glob
 import shutil
@@ -6,7 +8,8 @@ import shutil
 PIPELINE_RESULTS_BASE = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
 
 
-def smart_clean_wsclean_models(results_dir):
+def main() -> None:
+    results_dir = PIPELINE_RESULTS_BASE
     print("🧹 启动智能清理：基于 .ds 状态判断是否粉碎中间文件...")
     total_deleted_files = 0
     total_size_freed = 0
@@ -73,7 +76,5 @@ def smart_clean_wsclean_models(results_dir):
     print(f"💣 删除分通道 FITS 文件: {total_deleted_files} 个")
     print(f"🚀 总计释放存储空间: {freed_gb:.2f} GB")
     print("=" * 50)
-
-
 if __name__ == "__main__":
-    smart_clean_wsclean_models(PIPELINE_RESULTS_BASE)
+    main()

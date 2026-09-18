@@ -1,3 +1,5 @@
+"""Cross-match ASKAP catalogue detections with the stellar catalogue after PM correction."""
+
 import pandas as pd
 import numpy as np
 import re
@@ -5,74 +7,49 @@ from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
 import astropy.units as u
+from astropy.utils.exceptions import AstropyWarning
 from tqdm import tqdm
 import warnings
 import os
 import glob
+import sys
+from pathlib import Path
 
-warnings.filterwarnings('ignore')
-
-
-def project_path(relative_path):
-    current = os.path.abspath(os.path.dirname(__file__))
-    while not (
-        os.path.isdir(os.path.join(current, 'Code')) and
-        os.path.isdir(os.path.join(current, 'Processed_Data'))
-    ):
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-    return os.path.join(current, relative_path)
-
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CODE_ROOT = PROJECT_ROOT / "Code"
+if str(CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT))
 
 # --- 1. 配置文件路径 ---
 XML_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/ASKAP_Catalogue'
-ASKAP_CATALOGUE_CSV = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
-FINAL_OUTPUT_CSV = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct.csv')
+ASKAP_CATALOGUE_CSV = PROJECT_ROOT / "Processed_Data" / "Catalogue" / "01.askap_catalogue.csv"
+FINAL_OUTPUT_CSV = PROJECT_ROOT / "Processed_Data" / "Catalogue" / "02.final_confirmed_stars_direct.csv"
 
 # 你的原始恒星表
-STAR_CATALOG_CSV = project_path('Processed_Data/Catalogue/PS_2026.03.17_23.38.02.csv')
+STAR_CATALOG_CSV = PROJECT_ROOT / "Processed_Data" / "Catalogue" / "PS_2026.03.17_23.38.02.csv"
 
 PRECISION_THRESHOLD = 3.0  # 3角秒
 
 
-def extract_sbid_robust(text):
-    if pd.isna(text): return None
-    text = str(text)
-    sb_match = re.search(r'SB(\d+)', text, re.IGNORECASE)
-    if sb_match: return str(int(sb_match.group(1)))
-    digit_match = re.search(r'(\d+)', text)
-    if digit_match: return str(int(digit_match.group(1)))
-    return None
-
-
-def get_proper_motion(record, source_name):
-    """Return PM components and a warning when the catalogue lacks either one."""
-    pmra_value = record.get('sy_pmra') if 'sy_pmra' in record else record.get('pmra')
-    pmdec_value = record.get('sy_pmdec') if 'sy_pmdec' in record else record.get('pmdec')
-    missing = []
-    if pd.isna(pmra_value):
-        missing.append('sy_pmra')
-        pmra_value = 0.0
-    if pd.isna(pmdec_value):
-        missing.append('sy_pmdec')
-        pmdec_value = 0.0
-    warning = None
-    if missing:
-        warning = (f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing)}; "
-                   f"using pmra={float(pmra_value):.3f}, pmdec={float(pmdec_value):.3f} mas/yr. "
-                   "Epoch propagation continues without a complete reliable PM correction.")
-    return float(pmra_value), float(pmdec_value), not missing, warning
-
-
-def run_final_pipeline():
+def main() -> None:
     print(" 直接交叉 (Direct Crossmatch)...")
 
     # --- 2. 加载 ASKAP 观测元数据 ---
     obs_df = pd.read_csv(ASKAP_CATALOGUE_CSV)
     obs_df.columns = obs_df.columns.str.strip()
-    obs_df['sbid_clean'] = obs_df['obs_id'].apply(extract_sbid_robust)
+    sbid_clean = []
+    for text in obs_df['obs_id']:
+        if pd.isna(text):
+            sbid_clean.append(None)
+            continue
+        text = str(text)
+        sb_match = re.search(r'SB(\d+)', text, re.IGNORECASE)
+        if sb_match:
+            sbid_clean.append(str(int(sb_match.group(1))))
+            continue
+        digit_match = re.search(r'(\d+)', text)
+        sbid_clean.append(str(int(digit_match.group(1))) if digit_match else None)
+    obs_df['sbid_clean'] = sbid_clean
     # 建立映射字典
     sbid_to_mjd = obs_df.dropna(subset=['sbid_clean']).drop_duplicates(subset=['sbid_clean']).set_index('sbid_clean')[
         't_min'].to_dict()
@@ -92,7 +69,7 @@ def run_final_pipeline():
     missing_pm_df = stars_raw_df.loc[pmra_missing | pmdec_missing].copy()
     catalog_stem, catalog_suffix = os.path.splitext(STAR_CATALOG_CSV)
     missing_pm_output = f"{catalog_stem}_missing_proper_motion{catalog_suffix or '.csv'}"
-    missing_pm_df.to_csv(missing_pm_output, index=False)
+    missing_pm_df.to_csv(missing_pm_output, index=False, encoding="utf-8")
     print(
         f"⚠️ [NO PROPER MOTION] 在原始 PS 星表中发现 {len(missing_pm_df)} 条"
         f"自行信息不完整的记录；已完整导出至: {missing_pm_output}"
@@ -107,13 +84,25 @@ def run_final_pipeline():
     # 剔除坐标为空的无效数据
     stars_df = stars_df.dropna(subset=['ra', 'dec']).reset_index(drop=True)
 
-    pm_infos = [
-        get_proper_motion(star_row, str(star_row.get('hostname', index)))
-        for index, star_row in stars_df.iterrows()
-    ]
-    for _, _, _, pm_warning in pm_infos:
-        if pm_warning:
-            tqdm.write(pm_warning)
+    pm_infos = []
+    for index, star_row in stars_df.iterrows():
+        source_name = str(star_row.get('hostname', index))
+        pmra = star_row.get('sy_pmra') if 'sy_pmra' in star_row else star_row.get('pmra')
+        pmdec = star_row.get('sy_pmdec') if 'sy_pmdec' in star_row else star_row.get('pmdec')
+        missing_pm = []
+        if pd.isna(pmra):
+            missing_pm.append('sy_pmra')
+            pmra = 0.0
+        if pd.isna(pmdec):
+            missing_pm.append('sy_pmdec')
+            pmdec = 0.0
+        if missing_pm:
+            tqdm.write(
+                f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing_pm)}; "
+                f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+                "Epoch propagation continues without a complete reliable PM correction."
+            )
+        pm_infos.append((float(pmra), float(pmdec), not missing_pm, None))
 
     pmra = np.array([pm_info[0] for pm_info in pm_infos])
     pmdec = np.array([pm_info[1] for pm_info in pm_infos])
@@ -140,7 +129,12 @@ def run_final_pipeline():
 
     for xml_file in tqdm(xml_files, desc="交叉匹配中"):
         basename = os.path.basename(xml_file)
-        sbid = extract_sbid_robust(basename)
+        sb_match = re.search(r'SB(\d+)', basename, re.IGNORECASE)
+        if sb_match:
+            sbid = str(int(sb_match.group(1)))
+        else:
+            digit_match = re.search(r'(\d+)', basename)
+            sbid = str(int(digit_match.group(1))) if digit_match else None
         # 进行映射
         if not sbid or sbid not in sbid_to_mjd:
             missing_time_files += 1
@@ -165,7 +159,9 @@ def run_final_pipeline():
         if temp_df.empty:
             continue
 
-        stars_at_obs = stars_j2015.apply_space_motion(new_obstime=obs_time)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=AstropyWarning)
+            stars_at_obs = stars_j2015.apply_space_motion(new_obstime=obs_time)
 
         askap_sources = SkyCoord(
             ra=temp_df['col_ra_deg_cont'].values * u.deg,
@@ -231,12 +227,10 @@ def run_final_pipeline():
         # ==========================================
 
         final_df = final_df.sort_values(by='true_sep_arcsec').reset_index(drop=True)
-        final_df.to_csv(FINAL_OUTPUT_CSV, index=False)
+        final_df.to_csv(FINAL_OUTPUT_CSV, index=False, encoding="utf-8")
         print(f"\n 完成！解析出 {len(final_df)} 个匹配坐标。")
         print(f" 结果已保存至: {FINAL_OUTPUT_CSV}")
     else:
         print("\n 未找到符合交叉阈值的目标。")
-
-
 if __name__ == "__main__":
-    run_final_pipeline()
+    main()

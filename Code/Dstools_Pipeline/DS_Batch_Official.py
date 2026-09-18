@@ -1,62 +1,39 @@
+"""Run the official server-side ASKAP-to-DS reduction variant for target sources."""
+
 import os
 import re
 import glob
 import sys
 import shutil
 import tarfile
-import subprocess
 import logging
-import warnings
-from typing import List, Dict, Tuple, Optional, Any
+from typing import Any, Dict, List
 import pandas as pd
 import astropy.units as u
 from astropy.time import Time
 from astropy.coordinates import SkyCoord
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-warnings.filterwarnings('ignore')
-
-# --- 日志配置 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("pipeline_execution_official.log", encoding="utf-8")
-    ]
+from pathlib import Path
+CODE_ROOT = Path(__file__).resolve().parents[1]
+if str(CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT))
+from science_utils import (  # noqa: E402
+    extract_sbid_and_beam,
+    run_cmd,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 logger = logging.getLogger("ASKAP_Stellar_Pipeline_Official")
 WARNED_PM_SOURCES = set()
 
 
-def get_proper_motion(star_meta, source_name):
-    pmra = star_meta.get('sy_pmra') if 'sy_pmra' in star_meta else star_meta.get('pmra')
-    pmdec = star_meta.get('sy_pmdec') if 'sy_pmdec' in star_meta else star_meta.get('pmdec')
-    missing = []
-    if pd.isna(pmra): missing.append('sy_pmra'); pmra = 0.0
-    if pd.isna(pmdec): missing.append('sy_pmdec'); pmdec = 0.0
-    warning = None
-    if missing:
-        warning = (f"⚠️ [NO PROPER MOTION] {source_name}: missing {', '.join(missing)}; "
-                   f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
-                   "Epoch propagation continues without a complete reliable PM correction.")
-    return float(pmra), float(pmdec), warning
-
-
 # --- 路径与参数 ---
-def project_path(relative_path: str) -> str:
-    """自适应项目根目录定位"""
-    current = os.path.abspath(os.path.dirname(__file__))
-    while not (os.path.isdir(os.path.join(current, 'Code')) and os.path.isdir(os.path.join(current, 'Processed_Data'))):
-        parent = os.path.dirname(current)
-        if parent == current:
-            return os.path.join(os.getcwd(), relative_path)
-        current = parent
-    return os.path.join(current, relative_path)
 
 
-ASKAP_CATALOGUE_CSV: str = project_path('Processed_Data/Catalogue/01.askap_catalogue.csv')
-INPUT_CSV: str = project_path('Processed_Data/Catalogue/02.final_confirmed_stars_direct_2.csv')
+ASKAP_CATALOGUE_CSV = PROJECT_ROOT / "Processed_Data" / "Catalogue" / "01.askap_catalogue.csv"
+INPUT_CSV = PROJECT_ROOT / "Processed_Data" / "Catalogue" / "02.final_confirmed_stars_direct_2.csv"
 
 CASDA_BASE_PATH: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Data/Ms_Data"
 PIPELINE_RESULTS_BASE: str = "/mnt/home/hst/project/ASKAP_Stellar_with_Exoplanet_Serverbin/Result/DS"
@@ -68,196 +45,19 @@ MAX_CONCURRENT_MS: int = 7     # 同时并行处理的 MS 压缩包数量
 WSCLEAN_THREADS: int = 8     # 每个 WSClean 进程分配的线程数
 
 # --- 辅助函数 ---
-def extract_sbid_and_beam(filename: str) -> Tuple[Optional[str], Optional[str]]:
-    sb_match = re.search(r'SB(\d+)', filename, re.IGNORECASE)
-    beam_match = re.search(r'beam(\d+)', filename, re.IGNORECASE)
-    sbid = str(int(sb_match.group(1))) if sb_match else None
-    beam = str(int(beam_match.group(1))) if beam_match else None
-    return sbid, beam
-
-
-def run_cmd(cmd_str: str, cwd: str) -> None:
-    conda_bin_dir = os.path.dirname(sys.executable)
-    conda_lib_dir = os.path.join(os.path.dirname(conda_bin_dir), "lib")
-    custom_env = os.environ.copy()
-    custom_env["PATH"] = conda_bin_dir + os.pathsep + custom_env.get("PATH", "")
-    custom_env["LD_LIBRARY_PATH"] = conda_lib_dir + os.pathsep + custom_env.get("LD_LIBRARY_PATH", "")
-    cmd_str = f"env LD_LIBRARY_PATH={custom_env['LD_LIBRARY_PATH']} {cmd_str}"
-
-    try:
-        subprocess.run(cmd_str, shell=True, check=True, cwd=cwd, executable='/bin/bash', env=custom_env)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"命令执行失败: {cmd_str}")
-        raise e
 
 
 # --- 管线主流程 ---
-def process_single_tar(tar_path: str, clean_hostname: str, star_meta: Dict[str, Any], sbid: str, beam: str,
-                       obs_mjd: float) -> None:
-    tar_filename = os.path.basename(tar_path)
-
-    star_results_dir = os.path.join(PIPELINE_RESULTS_BASE, clean_hostname)
-    os.makedirs(star_results_dir, exist_ok=True)
-    ds_results_dir = os.path.join(star_results_dir, "DS_Results")
-    os.makedirs(ds_results_dir, exist_ok=True)
-
-    workspace_name = f"{clean_hostname}_SB{sbid}_beam{beam}_workspace"
-    workspace_dir = os.path.join(star_results_dir, workspace_name)
-
-    with tarfile.open(tar_path, 'r') as tar:
-        top_dirs = {n.split('/')[0] for n in tar.getnames() if n.strip()}
-        if not top_dirs:
-            raise ValueError(f"Tar 包结构异常: {tar_filename}")
-        extracted_folder_name = min(top_dirs, key=len)
-
-    name_parts = extracted_folder_name.split('.')
-    field_name = name_parts[1] if len(name_parts) > 1 else "UnknownField"
-
-    clean_ms_name = f"SB{sbid}.{field_name}.beam{beam}.ms"
-    subtracted_ms_name = f"SB{sbid}.{field_name}.beam{beam}.subtracted.ms"
-    subtracted_ms_path = os.path.join(workspace_dir, subtracted_ms_name)
-    final_ds_name = f"{clean_hostname}_SB{sbid}_beam{beam}.ds"
-
-    wsclean_model_dir_name = f"wsclean_model_{clean_hostname}_SB{sbid}_beam{beam}"
-    wsclean_model_full_path = os.path.join(workspace_dir, wsclean_model_dir_name)
-
-    wsclean_sentinel = os.path.join(workspace_dir, ".wsclean_done")
-    subtraction_sentinel = os.path.join(workspace_dir, ".subtraction_done")
-
-    logger.info(f"开始处理 -> 源: {clean_hostname} | SBID: {sbid} | Beam: {beam}")
-
-    expected_ds_path = os.path.join(ds_results_dir, final_ds_name)
-    if os.path.exists(expected_ds_path):
-        logger.info(f" [跳过] {final_ds_name} 已存在。")
-        return
-
-    # 坐标计算逻辑
-    pmra, pmdec, pm_warning = get_proper_motion(star_meta, clean_hostname)
-    if pm_warning and clean_hostname not in WARNED_PM_SOURCES:
-        logger.warning(pm_warning)
-        WARNED_PM_SOURCES.add(clean_hostname)
-
-    plx_val = star_meta.get('sy_plx', star_meta.get('plx', 10.0))
-    plx = 10.0 if pd.isna(plx_val) or float(plx_val) <= 0 else float(plx_val)
-
-    star_j2015 = SkyCoord(
-        ra=star_meta['ra'] * u.deg,
-        dec=star_meta['dec'] * u.deg,
-        pm_ra_cosdec=pmra * u.mas / u.yr,
-        pm_dec=pmdec * u.mas / u.yr,
-        distance=(1000 / plx) * u.pc,
-        frame='icrs',
-        obstime=Time('J2015.5')
-    )
-    obs_time = Time(obs_mjd, format='mjd')
-    star_at_obs = star_j2015.apply_space_motion(new_obstime=obs_time)
-    corr_ra = round(star_at_obs.ra.deg, 7)
-    corr_dec = round(star_at_obs.dec.deg, 7)
-    logger.info(
-        f"坐标计算 J2015.5 -> {obs_time.datetime.date()}: RA {corr_ra}, DEC {corr_dec}")
-
-    existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-*"))
-    wsclean_done = os.path.exists(wsclean_sentinel) and len(existing_mfs_images) > 0
-
-    if not wsclean_done:
-        logger.warning(f" WSClean 模型未就绪，开始建图 ({WSCLEAN_THREADS} 线程)...")
-        if os.path.exists(workspace_dir):
-            shutil.rmtree(workspace_dir)
-        os.makedirs(workspace_dir, exist_ok=True)
-
-        with tarfile.open(tar_path, 'r') as tar:
-            tar.extractall(path=workspace_dir)
-        os.rename(
-            os.path.join(workspace_dir, extracted_folder_name),
-            os.path.join(workspace_dir, clean_ms_name)
-        )
-
-        logger.info("执行预处理 (dstools-askap-preprocess)...")
-        run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
-
-        logger.info(f"执行 dstools-create-model 建模...")
-        os.makedirs(wsclean_model_full_path, exist_ok=True)
-        dstools_cmd = (
-            f"dstools-create-model -I 8192 -c 2.5 -N 1000000 -g 0.8 -r 0.5 "
-            f"-t 5 -m 6 -S --multiscale-scale-bias 0.7 --multiscale-max-scales 8 "
-            f"-f 8 --deconvolution-channels 8 -n 3 -j {WSCLEAN_THREADS} "
-            f"-o {wsclean_model_dir_name} --name wsclean --temp-dir {wsclean_model_dir_name} {clean_ms_name}"
-        )
-        run_cmd(dstools_cmd, cwd=workspace_dir)
-
-        with open(wsclean_sentinel, 'w', encoding='utf-8') as f:
-            f.write("WSCLEAN_SUCCESS")
-    else:
-        detected_model_path = os.path.dirname(existing_mfs_images[0])
-        wsclean_model_dir_name = os.path.basename(detected_model_path)
-        logger.info(f" [恢复] 检测到已有模型 {wsclean_model_dir_name}，跳过建图。")
-
-    subtraction_done = os.path.exists(subtracted_ms_path) and os.path.exists(subtraction_sentinel)
-
-    if not subtraction_done:
-        logger.info(f"--> [STEP 3] 插入模型并写入 MODEL_DATA (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
-        run_cmd(
-            f"dstools-insert-model -p {corr_ra} {corr_dec} -r {MASK_RADIUS} {wsclean_model_dir_name} {clean_ms_name}",
-            cwd=workspace_dir)
-
-        logger.info(f"--> [STEP 4] 执行背景减除 (dstools-subtract-model)...")
-        run_cmd(f"dstools-subtract-model -S {clean_ms_name}", cwd=workspace_dir)
-
-        with open(subtraction_sentinel, 'w', encoding='utf-8') as f:
-            f.write("SUBTRACTION_SUCCESS")
-        logger.info(f"背景减除完成: {subtracted_ms_name}")
-    else:
-        logger.info(f" [恢复] 背景减除数据集已就绪，跳过 subtract。")
-
-    logger.info(f"--> [STEP 5] 提取动态谱 (-u 500 -B)...")
-    if os.path.exists(os.path.join(workspace_dir, final_ds_name)):
-        os.remove(os.path.join(workspace_dir, final_ds_name))
-
-    run_cmd(f"dstools-extract-ds -p {corr_ra} {corr_dec} -v -u 500 -B {subtracted_ms_name} {final_ds_name}",
-            cwd=workspace_dir)
-
-    shutil.move(os.path.join(workspace_dir, final_ds_name), os.path.join(ds_results_dir, final_ds_name))
-    logger.info(f"✅ 完成，结果已保存。")
-
-
-def process_entire_source(clean_hostname: str, tar_files: List[str], star_meta: Dict[str, Any],
-                          sbid_to_mjd: Dict[str, float]) -> str:
-    logger.info(f"==========================================")
-    logger.info(f"处理源: {clean_hostname}，共 {len(tar_files)} 个包。当前启动 {MAX_CONCURRENT_MS} 个并发通道！")
-    logger.info(f"==========================================")
-
-    # 包装单包运行逻辑，以便在多线程中捕获异常
-    def _run_single(tar_path):
-        sbid, beam = extract_sbid_and_beam(os.path.basename(tar_path))
-        if not sbid or not beam:
-            return
-        if sbid not in sbid_to_mjd:
-            logger.warning(f"无法在 01 表中找到 SBID {sbid} 的对应观测时间，跳过该ms数据文件。")
-            return
-        obs_mjd = sbid_to_mjd[sbid]
-        process_single_tar(tar_path, clean_hostname, star_meta, sbid, beam, obs_mjd)
-
-    # 使用线程池执行并发
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_MS) as executor:
-        future_to_tar = {executor.submit(_run_single, tar_path): tar_path for tar_path in tar_files}
-
-        for future in as_completed(future_to_tar):
-            tar_path = future_to_tar[future]
-            try:
-                future.result()  # 阻塞等待单包处理完成
-            except KeyboardInterrupt:
-                logger.warning("接收到中断信号 (Ctrl+C)，退出。")
-                executor.shutdown(wait=False, cancel_futures=True)
-                raise
-            except Exception as e:
-                logger.exception(f"  处理包 {os.path.basename(tar_path)} 失败: {e}")
-                continue
-
-    return clean_hostname
-
-
+# --- 管线主流程：数据准备、线程调度与单包处理 ---
 def main() -> None:
-    warnings.filterwarnings('ignore', category=UserWarning)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("pipeline_execution_official.log", encoding="utf-8")
+        ]
+    )
     logger.info("ASKAP Stellar Pipeline 启动")
 
     if not os.path.exists(INPUT_CSV) or not os.path.exists(ASKAP_CATALOGUE_CSV):
@@ -275,6 +75,152 @@ def main() -> None:
     stars_df.columns = stars_df.columns.str.strip()
     stars_df['hostname_clean'] = stars_df['hostname'].astype(str).str.strip().str.replace(' ', '_')
     star_catalog_dict = stars_df.drop_duplicates(subset=['hostname_clean']).set_index('hostname_clean').to_dict('index')
+
+    # 单包 worker：保留线程池所需的回调边界，处理逻辑直接内联于此。
+    def _run_single(tar_path):
+        sbid, beam = extract_sbid_and_beam(os.path.basename(tar_path))
+        if not sbid or not beam:
+            return
+        if sbid not in sbid_to_mjd:
+            logger.warning(f"无法在 01 表中找到 SBID {sbid} 的对应观测时间，跳过该ms数据文件。")
+            return
+        obs_mjd = sbid_to_mjd[sbid]
+        tar_filename = os.path.basename(tar_path)
+
+        star_results_dir = os.path.join(PIPELINE_RESULTS_BASE, clean_hostname)
+        os.makedirs(star_results_dir, exist_ok=True)
+        ds_results_dir = os.path.join(star_results_dir, "DS_Results")
+        os.makedirs(ds_results_dir, exist_ok=True)
+
+        workspace_name = f"{clean_hostname}_SB{sbid}_beam{beam}_workspace"
+        workspace_dir = os.path.join(star_results_dir, workspace_name)
+
+        with tarfile.open(tar_path, 'r') as tar:
+            top_dirs = {n.split('/')[0] for n in tar.getnames() if n.strip()}
+            if not top_dirs:
+                raise ValueError(f"Tar 包结构异常: {tar_filename}")
+            extracted_folder_name = min(top_dirs, key=len)
+
+        name_parts = extracted_folder_name.split('.')
+        field_name = name_parts[1] if len(name_parts) > 1 else "UnknownField"
+
+        clean_ms_name = f"SB{sbid}.{field_name}.beam{beam}.ms"
+        subtracted_ms_name = f"SB{sbid}.{field_name}.beam{beam}.subtracted.ms"
+        subtracted_ms_path = os.path.join(workspace_dir, subtracted_ms_name)
+        final_ds_name = f"{clean_hostname}_SB{sbid}_beam{beam}.ds"
+
+        wsclean_model_dir_name = f"wsclean_model_{clean_hostname}_SB{sbid}_beam{beam}"
+        wsclean_model_full_path = os.path.join(workspace_dir, wsclean_model_dir_name)
+
+        wsclean_sentinel = os.path.join(workspace_dir, ".wsclean_done")
+        subtraction_sentinel = os.path.join(workspace_dir, ".subtraction_done")
+
+        logger.info(f"开始处理 -> 源: {clean_hostname} | SBID: {sbid} | Beam: {beam}")
+
+        expected_ds_path = os.path.join(ds_results_dir, final_ds_name)
+        if os.path.exists(expected_ds_path):
+            logger.info(f" [跳过] {final_ds_name} 已存在。")
+            return
+
+        # 坐标计算逻辑
+        pmra = star_meta.get('sy_pmra') if 'sy_pmra' in star_meta else star_meta.get('pmra')
+        pmdec = star_meta.get('sy_pmdec') if 'sy_pmdec' in star_meta else star_meta.get('pmdec')
+        missing_pm = []
+        if pd.isna(pmra):
+            missing_pm.append('sy_pmra')
+            pmra = 0.0
+        if pd.isna(pmdec):
+            missing_pm.append('sy_pmdec')
+            pmdec = 0.0
+        if missing_pm and clean_hostname not in WARNED_PM_SOURCES:
+            logger.warning(
+                f"⚠️ [NO PROPER MOTION] {clean_hostname}: missing {', '.join(missing_pm)}; "
+                f"using pmra={float(pmra):.3f}, pmdec={float(pmdec):.3f} mas/yr. "
+                "Epoch propagation continues without a complete reliable PM correction."
+            )
+            WARNED_PM_SOURCES.add(clean_hostname)
+
+        plx_val = star_meta.get('sy_plx', star_meta.get('plx', 10.0))
+        plx = 10.0 if pd.isna(plx_val) or float(plx_val) <= 0 else float(plx_val)
+
+        star_j2015 = SkyCoord(
+            ra=star_meta['ra'] * u.deg,
+            dec=star_meta['dec'] * u.deg,
+            pm_ra_cosdec=pmra * u.mas / u.yr,
+            pm_dec=pmdec * u.mas / u.yr,
+            distance=(1000 / plx) * u.pc,
+            frame='icrs',
+            obstime=Time('J2015.5')
+        )
+        obs_time = Time(obs_mjd, format='mjd')
+        star_at_obs = star_j2015.apply_space_motion(new_obstime=obs_time)
+        corr_ra = round(star_at_obs.ra.deg, 7)
+        corr_dec = round(star_at_obs.dec.deg, 7)
+        logger.info(
+            f"坐标计算 J2015.5 -> {obs_time.datetime.date()}: RA {corr_ra}, DEC {corr_dec}")
+
+        existing_mfs_images = glob.glob(os.path.join(workspace_dir, "*wsclean_model*", "*-MFS-*"))
+        wsclean_done = os.path.exists(wsclean_sentinel) and len(existing_mfs_images) > 0
+
+        if not wsclean_done:
+            logger.warning(f" WSClean 模型未就绪，开始建图 ({WSCLEAN_THREADS} 线程)...")
+            if os.path.exists(workspace_dir):
+                shutil.rmtree(workspace_dir)
+            os.makedirs(workspace_dir, exist_ok=True)
+
+            with tarfile.open(tar_path, 'r') as tar:
+                tar.extractall(path=workspace_dir)
+            os.rename(
+                os.path.join(workspace_dir, extracted_folder_name),
+                os.path.join(workspace_dir, clean_ms_name)
+            )
+
+            logger.info("执行预处理 (dstools-askap-preprocess)...")
+            run_cmd(f"dstools-askap-preprocess {clean_ms_name}", cwd=workspace_dir)
+
+            logger.info(f"执行 dstools-create-model 建模...")
+            os.makedirs(wsclean_model_full_path, exist_ok=True)
+            dstools_cmd = (
+                f"dstools-create-model -I 8192 -c 2.5 -N 1000000 -g 0.8 -r 0.5 "
+                f"-t 5 -m 6 -S --multiscale-scale-bias 0.7 --multiscale-max-scales 8 "
+                f"-f 8 --deconvolution-channels 8 -n 3 -j {WSCLEAN_THREADS} "
+                f"-o {wsclean_model_dir_name} --name wsclean --temp-dir {wsclean_model_dir_name} {clean_ms_name}"
+            )
+            run_cmd(dstools_cmd, cwd=workspace_dir)
+
+            with open(wsclean_sentinel, 'w', encoding='utf-8') as f:
+                f.write("WSCLEAN_SUCCESS")
+        else:
+            detected_model_path = os.path.dirname(existing_mfs_images[0])
+            wsclean_model_dir_name = os.path.basename(detected_model_path)
+            logger.info(f" [恢复] 检测到已有模型 {wsclean_model_dir_name}，跳过建图。")
+
+        subtraction_done = os.path.exists(subtracted_ms_path) and os.path.exists(subtraction_sentinel)
+
+        if not subtraction_done:
+            logger.info(f"--> [STEP 3] 插入模型并写入 MODEL_DATA (-p {corr_ra} {corr_dec} -r {MASK_RADIUS})...")
+            run_cmd(
+                f"dstools-insert-model -p {corr_ra} {corr_dec} -r {MASK_RADIUS} {wsclean_model_dir_name} {clean_ms_name}",
+                cwd=workspace_dir)
+
+            logger.info(f"--> [STEP 4] 执行背景减除 (dstools-subtract-model)...")
+            run_cmd(f"dstools-subtract-model -S {clean_ms_name}", cwd=workspace_dir)
+
+            with open(subtraction_sentinel, 'w', encoding='utf-8') as f:
+                f.write("SUBTRACTION_SUCCESS")
+            logger.info(f"背景减除完成: {subtracted_ms_name}")
+        else:
+            logger.info(f" [恢复] 背景减除数据集已就绪，跳过 subtract。")
+
+        logger.info(f"--> [STEP 5] 提取动态谱 (-u 500 -B)...")
+        if os.path.exists(os.path.join(workspace_dir, final_ds_name)):
+            os.remove(os.path.join(workspace_dir, final_ds_name))
+
+        run_cmd(f"dstools-extract-ds -p {corr_ra} {corr_dec} -v -u 500 -B {subtracted_ms_name} {final_ds_name}",
+                cwd=workspace_dir)
+
+        shutil.move(os.path.join(workspace_dir, final_ds_name), os.path.join(ds_results_dir, final_ds_name))
+        logger.info(f"✅ 完成，结果已保存。")
 
     star_folders = glob.glob(os.path.join(CASDA_BASE_PATH, '*'))
 
@@ -325,7 +271,24 @@ def main() -> None:
 
         if not tar_files: continue
 
-        process_entire_source(clean_hostname, tar_files, star_meta, sbid_to_mjd)
+        logger.info(f"==========================================")
+        logger.info(f"处理源: {clean_hostname}，共 {len(tar_files)} 个包。当前启动 {MAX_CONCURRENT_MS} 个并发通道！")
+        logger.info(f"==========================================")
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_MS) as executor:
+            future_to_tar = {
+                executor.submit(_run_single, tar_path): tar_path for tar_path in tar_files
+            }
+            for future in as_completed(future_to_tar):
+                tar_path = future_to_tar[future]
+                try:
+                    future.result()
+                except KeyboardInterrupt:
+                    logger.warning("接收到中断信号 (Ctrl+C)，退出。")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                except Exception as error:
+                    logger.exception(f"  处理包 {os.path.basename(tar_path)} 失败: {error}")
+                    continue
 
 
 if __name__ == "__main__":
