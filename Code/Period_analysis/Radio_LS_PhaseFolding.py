@@ -33,8 +33,10 @@ from science_utils import (  # noqa: E402
     add_panel_label,
     as_text,
     phase_bin_for_display,
+    phase_coordinates,
     rebin,
     rebin2d,
+    resolve_phase_ephemeris,
     slice_open_end,
 )
 
@@ -54,15 +56,22 @@ _PROJECT_MOUNT = "/home/dev/projects/ASKAP_Stellar_with_Exoplanet"
 # ==========================================
 # 1. 全局核心配置
 # ==========================================
-TESS_PERIOD = 0.1664         # TESS 测定的恒星光学周期 (天)
-TESS_PERIOD_ERR = 0.0008     # TESS 周期不确定度 (天)
-TESS_PERIOD_SIGMA = 3        # LS 图上 TESS 周期 band 的半宽 (σ)
+PERIOD_RESULT_FILE = Path(
+    "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/"
+    "TESS_Period/s29+69/TESS_Period_Result.md"
+)
+EPHEMERIS_ALIAS_RANK = 1
+USE_MANUAL_EPHEMERIS = False
+MANUAL_PERIOD_DAYS = 0.166467905791
+MANUAL_T0_BJD_TDB = 2459101.814513511024
+MANUAL_PERIOD_ERR_MINUS_S = 0.021370
+MANUAL_PERIOD_ERR_PLUS_S = 0.021024
 
 # 数据目录：包含待处理 .ds 文件的目录
 DS_FILES_DIR = "/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/Ds/2MASS_J01033563-5515561_A/Flare"
 
 # 待处理的 SBID 列表（空列表 = 目录下全部 SBID）
-TARGET_SBIDS = ["59565"]
+TARGET_SBIDS = ["59565","66827", "68040"]
 # "59565","66827", "68040"
 # 处理模式开关：
 #   True  = 将 TARGET_SBIDS 中多个 SBID 拼接合并，统一测量周期（激活窗口函数）
@@ -97,7 +106,7 @@ BOOTSTRAP_RANDOM_SEED = 42
 #   1 = 先折叠至 [0, 1)，再复制至 [1, 2)（规范的单周期折叠展示）；
 #   2 = 原始相位直接 mod 2，显示相邻两个实际周期的差异（不复制数据）。
 # 两种模式只影响相位图，不改变 LS、FAP、LOEO 或独立样本数。
-PHASE_FOLD_CYCLES = 2
+PHASE_FOLD_CYCLES = 1
 # 每个相位图面板的总分箱数。mod 1 的复制展示会自动均分给左右两半；
 # mod 2 则将此数用于两个实际周期的完整 [0, 2) 范围。
 PHASE_NBINS = 60
@@ -132,6 +141,20 @@ def _bootstrap_chunk(args):
 # ==========================================
 def main() -> None:
     """入口：逐项执行数据加载、周期分析和绘图，保持合并/逐 SBID 两种模式。"""
+    adopted = resolve_phase_ephemeris(
+        PERIOD_RESULT_FILE, EPHEMERIS_ALIAS_RANK, USE_MANUAL_EPHEMERIS,
+        MANUAL_PERIOD_DAYS, MANUAL_T0_BJD_TDB,
+        MANUAL_PERIOD_ERR_MINUS_S, MANUAL_PERIOD_ERR_PLUS_S,
+    )
+    reference_period = adopted["period_days"]
+    reference_t0 = adopted["t0_bjd_tdb"]
+    ephemeris_tag = "manual" if USE_MANUAL_EPHEMERIS else f"alias{EPHEMERIS_ALIAS_RANK}"
+    print(f"[INFO] adopted ephemeris {ephemeris_tag}: P={reference_period:.12f} d, "
+          f"T0={reference_t0:.9f} BJD_TDB, errors="
+          f"-{adopted['period_err_minus_s']:.6f}/+{adopted['period_err_plus_s']:.6f} s")
+    if not USE_MANUAL_EPHEMERIS:
+        print("[INFO] quoted period errors are conditional on the selected alias; "
+              "competing aliases remain separate candidate solutions.")
     if COMBINE_SBIDS:
         processing_targets = [
             (TARGET_SBIDS or None,
@@ -271,6 +294,7 @@ def main() -> None:
                 )
                 converted_time = at_site.tdb + at_site.light_travel_time(target_coord)
                 start_time = getattr(converted_time[0], converted_time[0].scale)
+                start_time.precision = 9  # 保留亚毫秒精度，供相对时间重组时使用
                 header["time_start"] = start_time.iso
                 header["time_scale"] = converted_time[0].scale
                 time = (converted_time - converted_time[0]).value * u.day.to(tunit)
@@ -461,6 +485,15 @@ def main() -> None:
         all_sbid_id = all_sbid_id[valid]
 
         print(f"\n[INFO] 数据拼接完成。共包含 {useful_count} 个观测块，有效积分点: {np.sum(valid)}")
+        sample_cycle, sample_mod1, sample_mod2 = phase_coordinates(
+            mjd[:1], reference_period, reference_t0, 2
+        )
+        print(
+            f"[PHASE CHECK] BJD_TDB={mjd[0]:.9f}; P={reference_period:.12f} d, "
+            f"T0={reference_t0:.9f}, source={adopted['source']}; "
+            f"cycle={sample_cycle[0]:.9f}, mod1={sample_mod1[0]:.9f}, "
+            f"mod2={sample_mod2[0]:.9f}"
+        )
 
 
 
@@ -494,9 +527,9 @@ def main() -> None:
         baseline_days = mjd[-1] - mjd[0]
 
         # 动态周期搜索上限：单 epoch 基线只有几小时，搜到 50 天没有意义。
-        # 上限取 min(PERIOD_MAX, baseline/2)，同时保证 TESS 目标周期
-        # 及其 2 倍一定在搜索范围内。
-        period_max_eff = min(PERIOD_MAX, max(TESS_PERIOD * 2, baseline_days / 2.0))
+        # 上限取 min(PERIOD_MAX, baseline/2)，同时保证参考星历及其 2 倍
+        # 一定在搜索范围内；射电 LS 峰本身仍是独立诊断结果。
+        period_max_eff = min(PERIOD_MAX, max(reference_period * 2, baseline_days / 2.0))
         if period_max_eff > baseline_days:
             print("[WARN] 搜索范围包含长于数据基线的周期；"
                   "这些结果仅用于目标周期检验，不能视为独立周期检测。")
@@ -530,11 +563,15 @@ def main() -> None:
         # 注意：analytic FAP 基于"独立高斯白噪声"假设，对含窗函数、epoch 间隔、
         # calibration 漂移的射电数据通常过于乐观，不能作为检测周期的唯一证据。
         if ENABLE_FAP:
-            fap_level_i_1pct = ls_i.false_alarm_level(FAP_PERCENT)
-            fap_level_v_1pct = ls_v.false_alarm_level(FAP_PERCENT)
+            fap_bounds = {
+                "minimum_frequency": float(frequency.min()),
+                "maximum_frequency": float(frequency.max()),
+            }
+            fap_level_i_1pct = ls_i.false_alarm_level(FAP_PERCENT, **fap_bounds)
+            fap_level_v_1pct = ls_v.false_alarm_level(FAP_PERCENT, **fap_bounds)
             try:
-                fap_v = ls_v.false_alarm_probability(np.max(power_v))
-                fap_i = ls_i.false_alarm_probability(np.max(power_i))
+                fap_v = ls_v.false_alarm_probability(np.max(power_v), **fap_bounds)
+                fap_i = ls_i.false_alarm_probability(np.max(power_i), **fap_bounds)
             except Exception:
                 fap_v, fap_i = None, None
         else:
@@ -547,9 +584,11 @@ def main() -> None:
         if compute_fap:
             boot_method = f"block={BOOTSTRAP_BLOCK_MIN}min" if BOOTSTRAP_BLOCK_MIN else "single-point permutation"
             n_proc = BOOTSTRAP_NPROC or (os.cpu_count() or 1)
+            bootstrap_grid_reduced = len(frequency) > BOOTSTRAP_MAX_NFREQ
             grid_n = min(len(frequency), BOOTSTRAP_MAX_NFREQ)
             print(f"[INFO] 正在进行 Bootstrap FAP 计算（{boot_method}，{BOOTSTRAP_ITERS} 次，"
-                  f"频率网格 {grid_n} 点，{n_proc} 进程）...")
+                  f"频率网格 {grid_n} 点{'（降采样网格）' if bootstrap_grid_reduced else ''}，"
+                  f"{n_proc} 进程）...")
             bootstrap_results = {}
             for bootstrap_label, bootstrap_flux in (
                 ("V", flux_v_norm),
@@ -565,8 +604,11 @@ def main() -> None:
                 bootstrap_epoch_ids = np.asarray(all_sbid_id)[order]
 
                 if len(bootstrap_frequency) > BOOTSTRAP_MAX_NFREQ:
-                    step = max(1, len(bootstrap_frequency) // BOOTSTRAP_MAX_NFREQ)
-                    bootstrap_frequency = bootstrap_frequency[::step]
+                    grid_indices = np.linspace(
+                        0, len(bootstrap_frequency) - 1,
+                        BOOTSTRAP_MAX_NFREQ, dtype=int,
+                    )
+                    bootstrap_frequency = bootstrap_frequency[grid_indices]
                 power_obs = np.max(
                     LombScargle(bootstrap_t, bootstrap_flux).power(bootstrap_frequency)
                 )
@@ -674,13 +716,15 @@ def main() -> None:
             boot_fap_v = boot_fap_i = None
 
         print(f"\n[INFO] === 射电周期拟合结果 ===")
-        print(f"   TESS 周期: {TESS_PERIOD:.5f} d")
-        print(f"   TESS 半周期  : {TESS_PERIOD / 2.0:.5f} d")
+        print(f"   Adopted ephemeris period: {reference_period:.12f} d; "
+              f"half-period={reference_period / 2.0:.12f} d; source={ephemeris_tag}")
         print(f"   Stokes V: {best_p_v:.5f} d,  FAP = {fap_v:.2e}" if fap_v is not None else f"   Stokes V: {best_p_v:.5f} d")
         print(f"   Stokes I: {best_p_i:.5f} d,  FAP = {fap_i:.2e}" if fap_i is not None else f"   Stokes I: {best_p_i:.5f} d")
         print(f"   数据基线: {baseline_days:.2f} d, V 覆盖 {baseline_days/best_p_v:.1f} 个周期")
         if compute_fap:
-            print(f"   Bootstrap FAP:  Stokes V = {boot_fap_v:.4f},  Stokes I = {boot_fap_i:.4f}")
+            grid_note = " (reduced frequency grid)" if bootstrap_grid_reduced else ""
+            print(f"   Bootstrap FAP{grid_note}:  Stokes V = {boot_fap_v:.4f},  "
+                  f"Stokes I = {boot_fap_i:.4f}")
         print(f"=====================================\n")
 
         # Leave-One-Epoch-Out 一致性检验：判断检测是否被单一 epoch 驱动
@@ -744,19 +788,19 @@ def main() -> None:
                 axw.tick_params(axis='y', labelcolor="gray", labelsize=8)
                 axw.yaxis.set_minor_locator(AutoMinorLocator(2))
 
-            # 标记参考周期线（含 TESS 周期不确定度 band，判断 LS 峰是否偏离）
-            ax.axvspan(TESS_PERIOD - TESS_PERIOD_SIGMA * TESS_PERIOD_ERR,
-                       TESS_PERIOD + TESS_PERIOD_SIGMA * TESS_PERIOD_ERR,
-                       color="#cc3333", alpha=0.15,
-                       label=f"TESS Period ± {TESS_PERIOD_SIGMA}σ = "
-                             f"{TESS_PERIOD:.4f} ± {TESS_PERIOD_SIGMA * TESS_PERIOD_ERR:.4f} d")
-            ax.axvline(x=TESS_PERIOD, color="#cc3333", linestyle="-.", linewidth=1.8,
-                       label=f"TESS Period = {TESS_PERIOD:.4f} d")
-            ax.axvspan(TESS_PERIOD / 2.0 - TESS_PERIOD_SIGMA * TESS_PERIOD_ERR / 2.0,
-                       TESS_PERIOD / 2.0 + TESS_PERIOD_SIGMA * TESS_PERIOD_ERR / 2.0,
-                       color="#cc3333", alpha=0.12, label="TESS Half-Period ± 3σ")
-            ax.axvline(x=TESS_PERIOD / 2.0, color="#cc3333", linestyle=":", linewidth=1.5,
-                       label=f"TESS Half Period = {TESS_PERIOD / 2.0:.4f} d")
+            # 保留原来的 TESS 周期图标注风格；数值取当前选定的算法星历。
+            # 阴影仍表示所选 alias 的条件 68% 误差范围，不包含竞争 alias。
+            reference_low = reference_period - adopted["period_err_minus_s"] / 86400.0
+            reference_high = reference_period + adopted["period_err_plus_s"] / 86400.0
+            ax.axvspan(reference_low, reference_high, color="#cc3333", alpha=0.15,
+                       label="TESS Period 68% interval")
+            ax.axvline(x=reference_period, color="#cc3333", linestyle="-.", linewidth=1.8,
+                       label=f"TESS Period = {reference_period:.4f} d")
+            ax.axvspan(reference_period / 2.0 - adopted["period_err_minus_s"] / 172800.0,
+                       reference_period / 2.0 + adopted["period_err_plus_s"] / 172800.0,
+                       color="#cc3333", alpha=0.12, label="TESS Half-Period 68% interval")
+            ax.axvline(x=reference_period / 2.0, color="#cc3333", linestyle=":", linewidth=1.5,
+                       label=f"TESS Half Period = {reference_period / 2.0:.4f} d")
 
             # 动态自适应 X 轴范围，保证最佳周期竖线一定在画面内。
             plot_x_max = max(0.5, best_p_i * 1.5, best_p_v * 1.5)
@@ -804,7 +848,9 @@ def main() -> None:
             ax_v.text(0.02, 0.95, f"Bootstrap FAP = {boot_fap_v:.3g}", transform=ax_v.transAxes, fontsize=9, va="top",
                       bbox=dict(boxstyle="round", fc="white", alpha=0.8))
 
-        out_ls = os.path.join(MASTER_OUTPUT_DIR, f"{SOURCE_NAME}{file_suffix}_LS.png")
+        out_ls = os.path.join(
+            MASTER_OUTPUT_DIR, f"{SOURCE_NAME}{file_suffix}_LS_{ephemeris_tag}.png"
+        )
         fig.subplots_adjust(top=0.96, bottom=0.07, hspace=0)
         fig.savefig(out_ls, dpi=FIGURE_DPI)
         plt.close(fig)
@@ -814,8 +860,8 @@ def main() -> None:
         # ---------------------------------------------
         # 将折叠目标增加为 4 个，分别验证 I 和 V 的拟合结果
         fold_targets = [
-            ("TESS Period", TESS_PERIOD, "#cc3333"),
-            ("TESS Half-Period", TESS_PERIOD / 2.0, "#cc3333"),
+            ("TESS Period", reference_period, "#cc3333"),
+            ("TESS Half-Period", reference_period / 2.0, "#cc3333"),
             ("Stokes I LS Peak", best_p_i, "steelblue"),
             ("Stokes V LS Peak", best_p_v, "darkorange")
         ]
@@ -834,16 +880,17 @@ def main() -> None:
                     ax.text(0.5, 0.5, "Invalid Period", ha='center', va='center')
                     continue
 
-                t_ref = np.min(mjd)
+                absolute_cycle, phase_base, phase_display = phase_coordinates(
+                    mjd, p_val, reference_t0, PHASE_FOLD_CYCLES
+                )
                 if PHASE_FOLD_CYCLES == 1:
                     # 规范展示：主相位 [0, 1) 折叠后原样复制到右半区。
-                    phase_base = np.mod((mjd - t_ref) / p_val, 1.0)
                     phase_full = np.concatenate((phase_base, phase_base + 1.0))
                     flux_plot = np.concatenate((flux_data, flux_data))
                     phase_epoch_ids = np.concatenate((all_sbid_id, all_sbid_id))
                 else:
                     # 诊断展示：保留相邻两个实际周期，不进行复制。
-                    phase_full = np.mod((mjd - t_ref) / p_val, 2.0)
+                    phase_full = phase_display
                     flux_plot = flux_data
                     phase_epoch_ids = all_sbid_id
 
@@ -966,7 +1013,7 @@ def main() -> None:
         fig.subplots_adjust(top=0.96, bottom=0.05, hspace=0, wspace=0.05)
         out_fold = os.path.join(
             MASTER_OUTPUT_DIR,
-            f"{SOURCE_NAME}{file_suffix}_Folding_{fold_tag}_bins{PHASE_NBINS}.png",
+            f"{SOURCE_NAME}{file_suffix}_Folding_{ephemeris_tag}_{fold_tag}_bins{PHASE_NBINS}.png",
         )
         fig.savefig(out_fold, dpi=FIGURE_DPI)
         plt.close(fig)

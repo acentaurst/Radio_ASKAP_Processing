@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import numpy as np
 import pandas as pd
 from astropy.coordinates import SkyCoord
+from astropy.io import fits
 import lightkurve as lk
 from tqdm.auto import tqdm
 from pathlib import Path
@@ -22,6 +23,7 @@ if str(CODE_ROOT) not in sys.path:
 from science_utils import (  # noqa: E402
     list_fits_files,
     retry_with_exponential_backoff,
+    safe_download_error,
 )
 
 # ========================
@@ -37,6 +39,61 @@ SUFFIX_MAP = {
     "lc": "_lc.fits",
     "hlsp": "_hlsp.fits",
 }
+
+
+def _valid_fits(path: str | os.PathLike[str]) -> bool:
+    """Reject empty/truncated files before treating a cached download as done."""
+    try:
+        file_size = os.path.getsize(path)
+        if file_size < 2880:
+            return False
+        with fits.open(path, memmap=True) as hdul:
+            hdul.verify("exception")
+            return len(hdul) > 0 and all(
+                (info := hdu.fileinfo()) is not None
+                and info["datLoc"] + info["datSpan"] <= file_size
+                for hdu in hdul
+            )
+    except Exception:
+        return False
+
+
+def _download_one(row, dl_dir: str, obs_id: str) -> tuple[bool, str | None]:
+    """Retry one MAST product; a return value alone is not completion."""
+    error_message = None
+    for attempt in range(1, 4):
+        before = list_fits_files(dl_dir)
+        downloaded = None
+        failure = None
+        try:
+            # Exiting the executor waits for the worker, avoiding overlapping
+            # writes if a timed-out request eventually finishes.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(row.download, download_dir=dl_dir)
+                downloaded = future.result(timeout=300)
+        except Exception as error:
+            failure = error
+
+        after = list_fits_files(dl_dir)
+        candidates = after - before
+        returned_path = getattr(downloaded, "filename", None)
+        if returned_path and os.path.abspath(os.fspath(returned_path)) in {
+            os.path.abspath(path) for path in after
+        }:
+            candidates.add(os.fspath(returned_path))
+        if any(_valid_fits(path) for path in candidates):
+            return True, None
+
+        if isinstance(failure, FutureTimeout):
+            error_message = "TimeoutError: 超时 (300s)，未得到有效 FITS"
+        elif failure is not None:
+            error_message = safe_download_error(failure)
+        else:
+            error_message = "ValueError: 下载返回后未找到有效 FITS"
+        print(f"      {obs_id} 下载失败 {attempt}/3: {error_message}")
+        if attempt < 3:
+            time.sleep(2 ** attempt)
+    return False, error_message
 
 
 def main() -> None:
@@ -138,7 +195,7 @@ def main() -> None:
         except Exception as error:
             print(
                 f"  [WARN] 坐标→TIC 解析失败: "
-                f"{type(error).__name__}: {error}"
+                f"{safe_download_error(error)}"
             )
 
         # Step 2: 名字查询 fallback。
@@ -162,7 +219,7 @@ def main() -> None:
             except Exception as error:
                 print(
                     f"  [WARN] 名字→TIC 解析失败: "
-                    f"{type(error).__name__}: {error}"
+                    f"{safe_download_error(error)}"
                 )
 
         # Step 3: lightkurve 搜索 fallback。
@@ -184,7 +241,7 @@ def main() -> None:
             except Exception as error:
                 print(
                     f"  [WARN] lightkurve 名称搜索失败: "
-                    f"{type(error).__name__}: {error}"
+                    f"{safe_download_error(error)}"
                 )
 
         # sanitize_name：保留原来的目录命名规则，不改变输出路径。
@@ -261,7 +318,7 @@ def main() -> None:
                         "HLSP 检索",
                     )
         except Exception as error:
-            err = f"{type(error).__name__}: {error}"
+            err = safe_download_error(error)
             print(
                 f"  [ERROR] {search_target} 检索失败（已重试 3 次）: {err}"
             )
@@ -341,6 +398,9 @@ def main() -> None:
             )
             existing_ids = {suffix: set() for suffix in SUFFIX_MAP.values()}
             for file_path in existing_files:
+                if not _valid_fits(file_path):
+                    print(f"  忽略不完整 FITS: {os.path.basename(file_path)}")
+                    continue
                 basename = os.path.basename(file_path)
                 matched_suffix = False
                 for suffix in SUFFIX_MAP.values():
@@ -408,46 +468,11 @@ def main() -> None:
                 dl_dir = target_dir
             os.makedirs(dl_dir, exist_ok=True)
 
-            # 内联 download_one；ThreadPoolExecutor 保持原有第三方回调。
-            success = False
-            obs_id_out = obs_id
-            err = None
-            for attempt in range(1, 3 + 1):
-                before = list_fits_files(dl_dir)
-                try:
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(
-                            row.download, download_dir=dl_dir
-                        )
-                        future.result(timeout=300)
-                    success = True
-                    break
-                except FutureTimeout:
-                    after = list_fits_files(dl_dir)
-                    if after - before:
-                        success = True
-                        break
-                    print(
-                        f"      {obs_id} 下载超时 (300s)，尝试 "
-                        f"{attempt}/3"
-                    )
-                    if attempt < 3:
-                        time.sleep(2 ** attempt)
-                    else:
-                        err = "超时 (300s)"
-                except Exception as error:
-                    after = list_fits_files(dl_dir)
-                    if after - before:
-                        success = True
-                        break
-                    if attempt < 3:
-                        time.sleep(2 ** attempt)
-                    else:
-                        err = str(error)
+            success, err = _download_one(row, dl_dir, obs_id)
             if not success:
                 err = err or "unknown"
-                all_failed.append((obs_id_out, err))
-                tqdm.write(f"  失败 {obs_id_out} [{dtype}]: {err}")
+                all_failed.append((obs_id, err))
+                tqdm.write(f"  失败 {obs_id} [{dtype}]: {err}")
             else:
                 total_succeeded += 1
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""绘制 TESS 光学模板与 ASKAP 动态谱的共同星历相位对照图。"""
+"""用手动 TESS 周期、误差和 BJD_TDB 零点绘制 ASKAP 相位对照图。"""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from astropy import units as u
 from astropy.coordinates import EarthLocation, SkyCoord
 from astropy.time import Time
 from astropy.utils import iers
+from scipy.stats import norm  # 将手填的一倍标准差换算为近似高斯区间。
 
 CODE_ROOT = Path(__file__).resolve().parents[1]
 if str(CODE_ROOT) not in sys.path:
@@ -40,12 +41,15 @@ from science_utils import (  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# 上游周期结果沿用本项目 HST Result 目录中的已验证 S29+S69 星历。
-PERIOD_DIR = Path("/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Result/TESS_Period/s29+69")
-PERIOD_RESULT_FILE = PERIOD_DIR / "TESS_Period_Result.md"
-PERIOD_BOOTSTRAP_FILE = PERIOD_DIR / "TESS_Period_Bootstrap.txt"
-PERIOD_TIMINGS_FILE = PERIOD_DIR / "TESS_Period_Timings.txt"
-SELECTED_ALIAS_RANK = 1
+# 手动周期：单位 d；周期误差与零点误差：单位 s，按一倍标准差解释。
+# 对称误差时把 minus/plus 填成相同数值；不读取 TESS_Period 的结果文件。
+MANUAL_PERIOD_DAYS = 0.166467905791
+MANUAL_PERIOD_ERR_MINUS_S = 0.021370
+MANUAL_PERIOD_ERR_PLUS_S = 0.021024
+MANUAL_T0_BJD_TDB = 2459101.814513511024  # 必须为 BJD_TDB，不能填写 MJD/BTJD。
+MANUAL_T0_ERR_S = 0.0  # 0 表示条件于固定零点；不是测得零点没有误差。
+# 手动模式忽略 P/T0 协方差、整数周期 alias 和模板极小位置误差，
+# 图上的包络是独立误差的近似传播，不等同于成对 bootstrap 或严格相位锁定。
 
 # 本项目现有的 TESS S69 与 ASKAP 动态谱完整路径。
 TESS_TEMPLATE_FILE = Path("/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/TESS_Data/2MASS_J01033563-5515561_A/"
@@ -95,7 +99,7 @@ ASKAP_HEIGHT_M = 361.0
 TARGET_RA_DEG: float | None = None
 TARGET_DEC_DEG: float | None = None
 
-# 相位模板、95% 相位置信带和动态谱色标的显示设置。
+# 相位模板、手动误差的近似 95% 包络和动态谱色标的显示设置。
 TESS_PHASE_BINS = 60
 BAND_CONFIDENCE_LEVEL = 0.95
 RADIO_FLUX_SCALE = 1.0
@@ -111,19 +115,34 @@ FIGURE_DPI = 300
 
 
 def main() -> None:
-    """读取上游星历和一份 ASKAP .ds，生成共同相位图及数值表。"""
+    """使用手动星历和一份 ASKAP .ds，生成共同相位图及数值表。"""
 
+    # 1. 先验证手动星历，再读数据或创建输出目录。
+    central_period_days = float(MANUAL_PERIOD_DAYS)
+    central_t0_bjd_tdb = float(MANUAL_T0_BJD_TDB)
+    period_errors_seconds = np.asarray(
+        [MANUAL_PERIOD_ERR_MINUS_S, MANUAL_PERIOD_ERR_PLUS_S], dtype=float
+    )
+    t0_error_seconds = float(MANUAL_T0_ERR_S)
+    if not np.isfinite(central_period_days) or central_period_days <= 0:
+        raise ValueError("MANUAL_PERIOD_DAYS 必须为正有限值，单位 d")
+    if not np.isfinite(central_t0_bjd_tdb) or central_t0_bjd_tdb < 2_000_000:
+        raise ValueError("MANUAL_T0_BJD_TDB 必须是完整的有限 BJD_TDB")
+    if (not np.isfinite(period_errors_seconds).all()
+            or np.any(period_errors_seconds < 0)
+            or not np.isfinite(t0_error_seconds) or t0_error_seconds < 0):
+        raise ValueError("手动周期/零点误差必须为非负有限值，单位 s")
+    period_error_minus_days, period_error_plus_days = period_errors_seconds / 86400.0
+    t0_error_days = t0_error_seconds / 86400.0
+    if max(period_error_minus_days, period_error_plus_days) >= central_period_days:
+        raise ValueError("周期误差必须小于周期；大误差不能使用线性相位传播")
+    if not np.isfinite(BAND_CONFIDENCE_LEVEL) or not 0 < BAND_CONFIDENCE_LEVEL < 1:
+        raise ValueError("BAND_CONFIDENCE_LEVEL 必须位于 0 和 1 之间")
+    confidence_z = float(norm.ppf((1.0 + BAND_CONFIDENCE_LEVEL) / 2.0))
+    if t0_error_seconds == 0:
+        print("⚠️ 手动星历：T0 视为固定，包络不包含零点误差；忽略 P/T0 协方差与 alias。")
     iers.conf.auto_download = False
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 1. 检查周期结果、bootstrap 样本和计时点接口。
-    for required_file in (
-        PERIOD_RESULT_FILE,
-        PERIOD_BOOTSTRAP_FILE,
-        PERIOD_TIMINGS_FILE,
-    ):
-        if not required_file.is_file():
-            raise FileNotFoundError(f"缺少 TESS_Period 输出：{required_file.resolve()}")
 
     tess_path = Path(TESS_TEMPLATE_FILE).expanduser()
     radio_path = Path(RADIO_FILE).expanduser()
@@ -152,116 +171,7 @@ def main() -> None:
     source_label = radio_name_match.group("source").replace("_", " ")
     sbid_label = f"SB{radio_name_match.group('sbid')}"
 
-    # 2. 解析当前 TESS_Period_Result.md 的混叠解表。
-    result_lines = PERIOD_RESULT_FILE.read_text(encoding="utf-8").splitlines()
-    table_header_index = next(
-        (
-            index
-            for index, line in enumerate(result_lines)
-            if line.strip().startswith("| Alias rank |")
-        ),
-        None,
-    )
-    if table_header_index is None:
-        raise ValueError(f"结果文件中找不到混叠解表：{PERIOD_RESULT_FILE}")
-    table_headers = [
-        cell.strip()
-        for cell in result_lines[table_header_index].strip().strip("|").split("|")
-    ]
-    expected_headers = {
-        "Alias rank",
-        "Preferred",
-        "Period (d)",
-        "Period (h)",
-        "68% error - (s)",
-        "68% error + (s)",
-        "Delta BIC",
-        "T0 (BJD_TDB)",
-        "Cycle-count offsets relative to preferred",
-    }
-    if not expected_headers.issubset(table_headers):
-        raise ValueError(f"混叠解表字段不完整：{table_headers}")
-
-    alias_records: list[dict[str, object]] = []
-    for line in result_lines[table_header_index + 2 :]:
-        if not line.strip().startswith("|"):
-            break
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) != len(table_headers) or not cells[0].isdigit():
-            continue
-        row = dict(zip(table_headers, cells, strict=True))
-        alias_records.append(
-            {
-                "alias_rank": int(row["Alias rank"]),
-                "preferred": str(row["Preferred"]).lower() == "yes",
-                "period_days": float(row["Period (d)"]),
-                "period_hours": float(row["Period (h)"]),
-                "period_error_minus_seconds": float(row["68% error - (s)"]),
-                "period_error_plus_seconds": float(row["68% error + (s)"]),
-                "delta_bic": float(row["Delta BIC"]),
-                "t0_bjd_tdb": float(row["T0 (BJD_TDB)"]),
-                "cycle_count_offsets": row[
-                    "Cycle-count offsets relative to preferred"
-                ],
-            }
-        )
-    alias_records.sort(key=lambda row: int(row["alias_rank"]))
-    alias_by_rank = {
-        int(row["alias_rank"]): row for row in alias_records
-    }
-    if SELECTED_ALIAS_RANK not in alias_by_rank:
-        raise ValueError(
-            f"SELECTED_ALIAS_RANK={SELECTED_ALIAS_RANK} 不在结果表中；"
-            f"可选值={sorted(alias_by_rank)}"
-        )
-    if any(float(row["delta_bic"]) >= 6 for row in alias_records):
-        raise ValueError("输入结果表包含 Delta BIC >= 6 的行")
-    selected_alias = alias_by_rank[SELECTED_ALIAS_RANK]
-    central_t0_bjd_tdb = float(selected_alias["t0_bjd_tdb"])
-    central_period_days = float(selected_alias["period_days"])
-
-    # 3. 读取所选 alias 的成对 T0/P bootstrap 样本。
-    with PERIOD_BOOTSTRAP_FILE.open(encoding="utf-8") as handle:
-        bootstrap_rows = list(csv.DictReader(handle, delimiter="\t"))
-    required_bootstrap_columns = {
-        "alias_rank",
-        "sample_index",
-        "t0_bjd_tdb",
-        "period_days",
-    }
-    if not bootstrap_rows or required_bootstrap_columns.difference(bootstrap_rows[0]):
-        raise ValueError("TESS_Period_Bootstrap.txt 的字段不完整")
-    selected_bootstrap_rows = [
-        row
-        for row in bootstrap_rows
-        if int(row["alias_rank"]) == SELECTED_ALIAS_RANK
-    ]
-    selected_bootstrap_rows.sort(key=lambda row: int(row["sample_index"]))
-    sample_indices = np.asarray(
-        [int(row["sample_index"]) for row in selected_bootstrap_rows],
-        dtype=int,
-    )
-    t0_samples = np.asarray(
-        [float(row["t0_bjd_tdb"]) for row in selected_bootstrap_rows],
-        dtype=float,
-    )
-    period_samples = np.asarray(
-        [float(row["period_days"]) for row in selected_bootstrap_rows],
-        dtype=float,
-    )
-    if len(selected_bootstrap_rows) < 100:
-        raise ValueError("所选 alias 的 bootstrap 样本少于 100 个")
-    if len(np.unique(sample_indices)) != len(sample_indices):
-        raise ValueError("所选 alias 的 sample_index 重复")
-    valid_samples = (
-        np.isfinite(t0_samples)
-        & np.isfinite(period_samples)
-        & (period_samples > 0)
-    )
-    t0_samples = t0_samples[valid_samples]
-    period_samples = period_samples[valid_samples]
-    if len(period_samples) < 100:
-        raise ValueError("所选 alias 的有效 bootstrap 样本少于 100 个")
+    # 手动模式不检查、不打开星历摘要、计时表或 bootstrap 文件。
 
     # 4. 预处理一份 TESS LC；这里只生成相位模板，不重新搜索周期。
     raw_tess = lk.read(tess_path)
@@ -646,9 +556,7 @@ def main() -> None:
         phase_centers[np.nanargmin(binned_tess_median)]
     )
 
-    # 8. 传播所选 alias 的光学极小包络，并合并相互重叠的区间。
-    q_low = 0.5 * (1.0 - BAND_CONFIDENCE_LEVEL)
-    q_high = 1.0 - q_low
+    # 8. 独立手动误差的近似高斯传播；相互重叠的边际区间只显示一个外包络。
     minimum_cycle_start = int(
         np.floor(
             (radio_bjd_tdb[0] - central_t0_bjd_tdb) / central_period_days
@@ -669,16 +577,17 @@ def main() -> None:
         nominal_local_phase = (
             nominal_event_bjd_tdb - radio_start_bjd_tdb
         ) / central_period_days
-        sampled_event_bjd_tdb = t0_samples + (
-            cycle_number + optical_minimum_phase
-        ) * period_samples
-        sampled_local_phase = (
-            sampled_event_bjd_tdb - radio_start_bjd_tdb
-        ) / central_period_days
-        band_low, band_high = np.quantile(
-            sampled_local_phase,
-            (q_low, q_high),
+        cycle_offset = cycle_number + optical_minimum_phase
+        # 负周期数下，P 的正误差导致事件时间提前，必须交换上下误差。
+        error_minus_days, error_plus_days = (
+            (period_error_minus_days, period_error_plus_days)
+            if cycle_offset >= 0
+            else (period_error_plus_days, period_error_minus_days)
         )
+        event_error_minus = np.hypot(t0_error_days, cycle_offset * error_minus_days)
+        event_error_plus = np.hypot(t0_error_days, cycle_offset * error_plus_days)
+        band_low = nominal_local_phase - confidence_z * event_error_minus / central_period_days
+        band_high = nominal_local_phase + confidence_z * event_error_plus / central_period_days
         if band_high < 0.0 or band_low > maximum_local_phase:
             continue
         raw_minimum_bands.append(
@@ -785,7 +694,7 @@ def main() -> None:
                     edgecolor="#A6A6A6",
                     linewidth=0.7,
                     label=(
-                        f"TESS minimum {BAND_CONFIDENCE_LEVEL * 100:.0f}% interval"
+                        f"Approx. {BAND_CONFIDENCE_LEVEL * 100:.0f}% TESS minimum envelope"
                         if axis_index == 0 and band_index == 0
                         else "_nolegend_"
                     ),
@@ -911,12 +820,20 @@ def main() -> None:
         fontweight="bold",
         y=0.995,
     )
+    figure.text(
+        0.5, 0.015,
+        f"Manual P={central_period_days:.12f} d (-{MANUAL_PERIOD_ERR_MINUS_S:.6f}/+{MANUAL_PERIOD_ERR_PLUS_S:.6f} s, 1 sigma); "
+        f"T0={central_t0_bjd_tdb:.9f} BJD_TDB (sigma={MANUAL_T0_ERR_S:g} s)\n"
+        "Independent Gaussian errors; no P–T0 covariance, alias or template-minimum uncertainty.",
+        ha="center", va="bottom", fontsize=8,
+    )
     output_stem = f"{radio_path.stem}_P{central_period_days:.4f}"
-    figure.subplots_adjust(left=0.07, right=0.965, top=0.95, bottom=0.06,
+    figure.subplots_adjust(left=0.07, right=0.965, top=0.95, bottom=0.095,
                            hspace=0.0, wspace=0.025)
     figure.savefig(
         OUTPUT_DIR / f"{output_stem}_Combined.png",
         dpi=FIGURE_DPI,
+        bbox_inches="tight",  # 保留色标单位和手动星历页脚，不裁掉画布外标签。
     )
     plt.close(figure)
 
@@ -967,17 +884,13 @@ def main() -> None:
         default=float("nan"),
     )
     print(
-        f"相位验证完成：alias rank={SELECTED_ALIAS_RANK}；"
-        f"P={central_period_days:.12f} d；"
+        f"相位验证完成：手动周期 P={central_period_days:.12f} d；"
+        f"一倍标准差 -{MANUAL_PERIOD_ERR_MINUS_S:.6f}/+{MANUAL_PERIOD_ERR_PLUS_S:.6f} s；"
+        f"T0={central_t0_bjd_tdb:.12f} BJD_TDB ±{MANUAL_T0_ERR_S:.6f} s；"
         f"光学极小={optical_minimum_phase:.6f}；"
-        f"最大95%相位区间宽度={maximum_band_width:.6f} cycle；"
+        f"最大近似{BAND_CONFIDENCE_LEVEL * 100:.0f}%包络宽度={maximum_band_width:.6f} cycle；"
         f"输出={OUTPUT_DIR.resolve()}"
     )
-    if len(alias_records) > 1:
-        print(
-            f"结果表中还有 {len(alias_records) - 1} 个 Delta BIC < 6 的竞争 alias；"
-            "本图只显示配置的 SELECTED_ALIAS_RANK。"
-        )
 
 
 if __name__ == "__main__":

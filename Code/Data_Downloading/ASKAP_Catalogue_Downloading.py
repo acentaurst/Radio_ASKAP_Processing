@@ -2,12 +2,15 @@
 
 import numpy as np
 import pandas as pd
+from astroquery import log as astroquery_log
 from astroquery.casda import Casda
 from astroquery.utils.tap.core import TapPlus
 import os
+import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 
@@ -16,7 +19,7 @@ from pathlib import Path
 OPAL_USER = "acentauri_huangst@163.com"
 DOWNLOAD_DIR = '/Volumes/HST/Research/ASKAP_Stellar_with_Planet_Localbin/Data/ASKAP_Catalogue'
 FAILED_CSV = os.path.join(DOWNLOAD_DIR, "failed_downloads.csv")
-START_FROM_NUMBER = 7600  # 从第几个文件开始
+START_FROM_NUMBER = 1  # 从第几个文件开始
 BATCH_SIZE = 3
 MAX_RETRY = 3  # staging / download 都最多试 3 次
 SLEEP_BETWEEN_RETRY = 5  # 秒
@@ -24,12 +27,53 @@ SLEEP_BETWEEN_RETRY = 5  # 秒
 # 1.LOGIN
 casda = Casda()
 
+
+def _error_summary(error: Exception) -> str:
+    """Keep the exception reason while hiding credentials in URL queries."""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    summary = type(error).__name__
+    if status is not None:
+        summary += f" HTTP {status}"
+    body = getattr(response, "text", "") or ""
+    code = re.search(r"<Code>([A-Za-z0-9_]+)</Code>", body)
+    if code:
+        summary += f" {code.group(1)}"
+    detail = str(error).strip()
+    detail = re.sub(r"\?[^\s'\"<>]+", " [URL query redacted]", detail)
+    detail = re.sub(r"(https?://)[^/@\s]+@", r"\1[credentials redacted]@", detail)
+    detail = re.sub(
+        r"(?i)\b(?:x-amz-signature|x-amz-credential|awsaccesskeyid|access_token|token|authorization|password|client_secret|api[_-]?key)\s*[:=]\s*[^\s,'\"<>]+",
+        "[sensitive value redacted]",
+        detail,
+    )
+    if detail:
+        summary += f": {detail}"
+    return summary
+
+
+def _record_failure(filename: str, phase: str, attempt: int, message: str) -> None:
+    record = {
+        "filename": filename,
+        "stage_or_download": phase,
+        "attempt": attempt,
+        "error_message": message,
+    }
+    pd.DataFrame([record]).to_csv(
+        FAILED_CSV,
+        mode="a",
+        index=False,
+        header=not os.path.exists(FAILED_CSV),
+        encoding="utf-8",
+    )
+
+
 def main() -> None:
     try:
         casda.login(username=OPAL_USER, store_password=False)
         print(f" Logged in as {OPAL_USER}")
     except Exception as e:
-        print(f" Login failed: {e}")
+        print(f" Login failed: {_error_summary(e)}")
         sys.exit(1)
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -52,106 +96,92 @@ def main() -> None:
 
     # 4.DOWNLOAD LOOP (WITH RETRY & SKIP EXISTING)
     urls_to_download = []
+    pending_groups = []  # (catalogue filename, its table, its staged URLs)
 
+    # The sentinel iteration flushes the final batch even if the last file was skipped.
+    for i in range(start_index, total_files + 1):
+        if i < total_files:
+            filename = unique_files[i]
+            local_filepath = os.path.join(DOWNLOAD_DIR, filename)
 
-    for i in range(start_index, total_files):
-        filename = unique_files[i]
-        local_filepath = os.path.join(DOWNLOAD_DIR, filename)
+            if os.path.exists(local_filepath):
+                print(f"\n [{i + 1}/{total_files}] ⏭ Skipped: {filename} (Already exists in local dir)")
+                continue
 
-        # 检查本地文件是否存在
-        if os.path.exists(local_filepath):
-            print(f"\n [{i + 1}/{total_files}] ⏭ Skipped: {filename} (Already exists in local dir)")
-            continue
-
-        print(f"\n [{i + 1}/{total_files}]  Processing: {filename}")
-
-        pdata = data[data["filename"] == filename]
-
-        # ---------------- STAGING (RETRY) ----------------
-        staged = False
-        for attempt in range(1, MAX_RETRY + 1):
-            try:
-                urls = casda.stage_data(pdata)
-                urls_to_download.extend(u for u in urls if u not in urls_to_download)
-                staged = True
-                break
-            except Exception as e:
-                print(f"   ️ Staging attempt {attempt} failed: {e}")
-                failure_record = {
-                    "filename": filename,
-                    "stage_or_download": "stage",
-                    "attempt": attempt,
-                    "error_message": str(e)
-                }
-                failure_df = pd.DataFrame([failure_record])
-                failure_header = not os.path.exists(FAILED_CSV)
-                failure_df.to_csv(
-                    FAILED_CSV, mode="a", index=False, header=failure_header, encoding="utf-8"
-                )
-                time.sleep(SLEEP_BETWEEN_RETRY)
-
-        if not staged:
-            print("    Staging failed after max retries.")
-            continue
-
-        # ---------------- DOWNLOAD (BATCH) ----------------
-        if len(urls_to_download) >= BATCH_SIZE:
-            batch_urls = urls_to_download
-            urls_to_download = []
+            print(f"\n [{i + 1}/{total_files}]  Processing: {filename}")
+            pdata = data[data["filename"] == filename]
+            staged = False
             for attempt in range(1, MAX_RETRY + 1):
-                print(f"    Download attempt {attempt} ({len(batch_urls)} files)")
                 try:
-                    casda.download_files(batch_urls, savedir=DOWNLOAD_DIR)
-                    print("    Batch download success")
+                    urls = casda.stage_data(pdata)
+                    if not urls:
+                        raise ValueError("CASDA staging returned no URLs")
+                    staged = True
                     break
-                except Exception as e:
-                    print(f"    Download failed: {e}")
-                    if attempt == MAX_RETRY:
-                        for url in batch_urls:
-                            failure_record = {
-                                "filename": os.path.basename(url),
-                                "stage_or_download": "download",
-                                "attempt": attempt,
-                                "error_message": str(e),
-                            }
-                            failure_df = pd.DataFrame([failure_record])
-                            failure_header = not os.path.exists(FAILED_CSV)
-                            failure_df.to_csv(
-                                FAILED_CSV, mode="a", index=False,
-                                header=failure_header, encoding="utf-8"
-                            )
-                    else:
+                except Exception as error:
+                    summary = _error_summary(error)
+                    print(f"    Staging attempt {attempt} failed: {summary}")
+                    _record_failure(filename, "stage", attempt, summary)
+                    if attempt < MAX_RETRY:
                         time.sleep(SLEEP_BETWEEN_RETRY)
 
-    # ---------------- 处理最后剩余的未满 BATCH_SIZE 的文件 ----------------
-    if len(urls_to_download) > 0:
-        print("\n▶ Processing final remaining batch...")
-        batch_urls = urls_to_download
+            if not staged:
+                print("    Staging failed after max retries.")
+                continue
+
+            new_urls = []
+            for url in urls:
+                if url not in urls_to_download and url not in new_urls:
+                    new_urls.append(url)
+            if new_urls:
+                urls_to_download.extend(new_urls)
+                pending_groups.append((filename, pdata, new_urls))
+            if len(urls_to_download) < BATCH_SIZE:
+                continue
+        elif not pending_groups:
+            break
+        else:
+            print("\n▶ Processing final remaining batch...")
+
+        batch_groups = pending_groups
+        pending_groups = []
         urls_to_download = []
-        for attempt in range(1, MAX_RETRY + 1):
-            print(f"    Download attempt {attempt} ({len(batch_urls)} files)")
-            try:
-                casda.download_files(batch_urls, savedir=DOWNLOAD_DIR)
-                print("    Batch download success")
-                break
-            except Exception as e:
-                print(f"    Download failed: {e}")
-                if attempt == MAX_RETRY:
-                    for url in batch_urls:
-                        failure_record = {
-                            "filename": os.path.basename(url),
-                            "stage_or_download": "download",
-                            "attempt": attempt,
-                            "error_message": str(e),
-                        }
-                        failure_df = pd.DataFrame([failure_record])
-                        failure_header = not os.path.exists(FAILED_CSV)
-                        failure_df.to_csv(
-                            FAILED_CSV, mode="a", index=False,
-                            header=failure_header, encoding="utf-8"
-                        )
-                else:
-                    time.sleep(SLEEP_BETWEEN_RETRY)
+
+        # Astroquery downloads URLs serially; grouping by catalogue isolates errors.
+        for filename, pdata, original_urls in batch_groups:
+            current_urls = original_urls
+            for attempt in range(1, MAX_RETRY + 1):
+                if attempt > 1:
+                    try:
+                        current_urls = casda.stage_data(pdata)
+                        if not current_urls:
+                            raise ValueError("CASDA restaging returned no URLs")
+                    except Exception as error:
+                        summary = _error_summary(error)
+                        print(f"    Restaging attempt {attempt} failed for {filename}: {summary}")
+                        _record_failure(filename, "stage", attempt, summary)
+                        if attempt < MAX_RETRY:
+                            time.sleep(SLEEP_BETWEEN_RETRY)
+                        continue
+
+                print(f"    Download attempt {attempt} ({len(current_urls)} files): {filename}")
+                previous_log_level = astroquery_log.level
+                astroquery_log.setLevel("WARNING")
+                try:
+                    casda.download_files(current_urls, savedir=DOWNLOAD_DIR)
+                    print(f"    Download success: {filename}")
+                    break
+                except Exception as error:
+                    summary = _error_summary(error)
+                    print(f"    Download failed: {filename}: {summary}")
+                    if attempt == MAX_RETRY:
+                        for url in current_urls:
+                            safe_name = unquote(os.path.basename(urlparse(url).path))
+                            _record_failure(safe_name, "download", attempt, summary)
+                    else:
+                        time.sleep(SLEEP_BETWEEN_RETRY)
+                finally:
+                    astroquery_log.setLevel(previous_log_level)
 
     # 5.FINISH
     print("\n" + "=" * 60)

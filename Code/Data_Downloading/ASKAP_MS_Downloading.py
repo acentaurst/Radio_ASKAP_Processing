@@ -3,6 +3,8 @@
 import numpy as np
 import pandas as pd
 import os
+import sys
+import tempfile
 import time
 import warnings
 import keyring
@@ -16,6 +18,11 @@ from tqdm import tqdm
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CODE_ROOT = PROJECT_ROOT / "Code"
+if str(CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT))
+
+from science_utils import quiet_casda_download, safe_download_error  # noqa: E402
 
 # ————————————————— 1. 自动化环境与路径管理 —————————————————
 
@@ -33,6 +40,44 @@ FAILED_LIST_PATH = os.path.join(os.path.dirname(CASDA_BASE_PATH), '0.failed_ms_d
 TARGET_SOURCES = ['2MASS J01033563-5515561 A']
 MAX_RETRIES = 3
 BATCH_SIZE = 15  # 每次最多向服务器请求的文件数量，避免 414 URI Too Long
+MIN_FILE_SIZE = 10 * 1024  # MS archive minimum; checksum needs only be nonempty
+
+
+def _download_ms_product(casda, row_table, source_dir, sb_num, main_name):
+    """Stage anew on every attempt and commit a validated MS/checksum pair."""
+    error_message = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with tempfile.TemporaryDirectory(prefix=".ms_download_", dir=CASDA_BASE_PATH) as temp_dir:
+                urls = casda.stage_data(row_table)
+                if not urls:
+                    raise ValueError("CASDA staging returned no URLs")
+                with quiet_casda_download():
+                    returned = casda.download_files(urls, savedir=temp_dir)
+                if not returned:
+                    raise ValueError("CASDA download returned no files")
+                paths = {Path(path).name: Path(path) for path in returned}
+                main_file = paths.get(main_name)
+                checksum_file = paths.get(f"{main_name}.checksum")
+                if main_file is None or checksum_file is None:
+                    raise ValueError(f"Missing MS or checksum for {main_name}")
+                for path, minimum in ((main_file, MIN_FILE_SIZE), (checksum_file, 0)):
+                    if path.resolve().parent != Path(temp_dir).resolve():
+                        raise ValueError("CASDA returned a file outside the staging directory")
+                    if not path.is_file() or path.stat().st_size <= minimum:
+                        raise ValueError(f"Incomplete CASDA file: {path.name}")
+
+                # Commit the main archive last: a present main file never masks
+                # a missing checksum on the next run.
+                os.replace(checksum_file, Path(source_dir) / f"{sb_num}_{main_name}.checksum")
+                os.replace(main_file, Path(source_dir) / f"{sb_num}_{main_name}")
+            return True, ""
+        except Exception as error:
+            error_message = safe_download_error(error)
+            tqdm.write(f"  [MS {main_name} {attempt}/{MAX_RETRIES}] {error_message}")
+            if attempt < MAX_RETRIES:
+                time.sleep(10)
+    return False, error_message
 
 # ————————————————— 2. 初始化与数据预处理  —————————————————
 
@@ -41,7 +86,10 @@ def main() -> None:
     os.makedirs(CASDA_BASE_PATH, exist_ok=True)
 
     casda = Casda()
-    casda.login(username=OPAL_USER, store_password=True)
+    try:
+        casda.login(username=OPAL_USER, store_password=True)
+    except Exception as error:
+        raise RuntimeError(f"CASDA 登录失败: {safe_download_error(error)}") from None
     print("CASDA 登录成功，正在初始化...")
     tap = TapPlus(url="https://casda.csiro.au/casda_vo_tools/tap")
 
@@ -169,13 +217,15 @@ def main() -> None:
                     file_path = os.path.join(source_dir, expected_local_name)
                     # 期望的 checksum 文件路径
                     checksum_path = f"{file_path}.checksum"
-                    # 只有当主文件和其专属的 .checksum 文件同时存在时，才认为下载完整
-                    is_complete = os.path.exists(file_path) and os.path.exists(checksum_path)
+                    # 不完整文件保留至成功重下后原子替换，避免失败时丢失旧数据。
+                    is_complete = (
+                        os.path.isfile(file_path)
+                        and os.path.getsize(file_path) > MIN_FILE_SIZE
+                        and os.path.isfile(checksum_path)
+                        and os.path.getsize(checksum_path) > 0
+                    )
 
                     if not is_complete:
-                        if os.path.exists(file_path): os.remove(file_path)
-                        # 为了干净，如果残存了旧的校验文件也顺手删掉
-                        if os.path.exists(checksum_path): os.remove(checksum_path)
                         files_to_download_indices.append(global_idx)
 
                 if not files_to_download_indices:
@@ -195,65 +245,27 @@ def main() -> None:
 
                 for i in range(0, total_files, BATCH_SIZE):
                     batch_indices = files_to_download_indices[i: i + BATCH_SIZE]
-                    indices_array = np.array(batch_indices)
-                    download_table = results[indices_array]
-
-                    # 【核心修复 1】：预先提取当前批次的具体文件名，方便报错时精准记录
-                    current_batch_files = []
+                    # 批次仍限制处理规模；按文件隔离 staging 与下载，坏链接
+                    # 不会让同批其他 MS 一起失败。
                     for idx in batch_indices:
                         row = results[idx]
                         sb_num = row['obs_id'].replace('ASKAP-', '')
-                        fname = os.path.basename(row['filename'])
-                        current_batch_files.append(f"{sb_num}_{fname}")
-
-                    # 【核心修复 2】：为单个批次设置局部重试与异常捕获，防止波及整个源
-                    batch_success = False
-                    batch_err_msg = ""
-
-                    for inner_attempt in range(MAX_RETRIES):
-                        try:
-                            url_list = casda.stage_data(download_table)
-                            if url_list:
-                                filelist = casda.download_files(url_list, savedir=CASDA_BASE_PATH)
-                                if filelist:
-                                    for downloaded_file in filelist:
-                                        orig_basename = os.path.basename(downloaded_file)
-                                        for idx in batch_indices:
-                                            row = results[idx]
-                                            main_file_basename = os.path.basename(row['filename'])
-
-                                            # 如果下载的文件是主文件，或者主文件名加上 .checksum
-                                            if orig_basename == main_file_basename or orig_basename == f"{main_file_basename}.checksum":
-                                                sb_id_num = row['obs_id'].replace('ASKAP-', '')
-                                                final_path = os.path.join(source_dir, f"{sb_id_num}_{orig_basename}")
-
-                                                if os.path.exists(final_path): os.remove(final_path)
-                                                os.rename(downloaded_file, final_path)
-
-                                                # 只有在归类主文件时，才增加成功下载的计数
-                                                if orig_basename == main_file_basename:
-                                                    downloaded_count += 1
-                                                break
-                                    batch_success = True
-                                    break  # 批次下载成功，跳出局部重试
-                                else:
-                                    raise Exception("文件下载返回为空列表")
-                            else:
-                                raise Exception("Staging 失败，未返回下载链接")
-
-                        except Exception as inner_e:
-                            batch_err_msg = str(inner_e)
-                            if inner_attempt < MAX_RETRIES - 1:
-                                time.sleep(10)  # 下载失败局部冷却
-                            else:
-                                pass  # 局部重试耗尽，跳出交由下方记录错误
-
-                    # 【核心修复 3】：记录具体文件名，且使用 continue 继续下一个批次
-                    if not batch_success:
-                        tqdm.write(f" [错误] 源 {clean_hostname} 第 {i // BATCH_SIZE + 1} 批次下载彻底失败。")
-                        for f_name in current_batch_files:
-                            local_errors.append({'Source': clean_hostname, 'File': f_name, 'Error': batch_err_msg})
-                        # 注意：这里没有 return，代码会进入下一次 for 循环，继续下载后续文件批次
+                        main_name = os.path.basename(row['filename'])
+                        success, error_message = _download_ms_product(
+                            casda,
+                            results[np.array([idx])],
+                            source_dir,
+                            sb_num,
+                            main_name,
+                        )
+                        if success:
+                            downloaded_count += 1
+                        else:
+                            local_errors.append({
+                                'Source': clean_hostname,
+                                'File': f"{sb_num}_{main_name}",
+                                'Error': error_message,
+                            })
 
                 # 所有批次循环结束评估结果
                 if downloaded_count > 0 or not local_errors:
@@ -268,7 +280,7 @@ def main() -> None:
 
             except Exception as e:
                 # 这里捕获的是 TAP 请求层面的全局灾难性异常
-                err_msg = str(e)
+                err_msg = safe_download_error(e)
                 if any(k in err_msg for k in ["IncompleteRead", "Connection broken", "Timeout", "EOFError", "time out"]):
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(15)

@@ -28,6 +28,8 @@ CODE_ROOT = PROJECT_ROOT / "Code"
 if str(CODE_ROOT) not in sys.path:
     sys.path.insert(0, str(CODE_ROOT))
 
+from science_utils import quiet_casda_download, safe_download_error  # noqa: E402
+
 # Astropy 的空间运动近似警告仅在实际传播调用附近局部抑制。
 
 
@@ -55,7 +57,10 @@ def main() -> None:
 
     OPAL_USER = "acentauri_huangst@163.com"
     casda = Casda()
-    casda.login(username=OPAL_USER, store_password=True)
+    try:
+        casda.login(username=OPAL_USER, store_password=True)
+    except Exception as error:
+        raise RuntimeError(f"CASDA 登录失败: {safe_download_error(error)}") from None
 
     # 2. 路径配置与数据读取
     time_info_file = PROJECT_ROOT / "Processed_Data" / "Catalogue" / "01.askap_catalogue.csv"
@@ -149,7 +154,7 @@ def main() -> None:
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(5)
                     else:
-                        print(f"  -> [网络错误] 连续检索 TAP 失败: {e}")
+                        print(f"  -> [网络错误] 连续检索 TAP 失败: {safe_download_error(e)}")
 
             if r is None or len(r) == 0:
                 print(f"  -> [Stokes {stokes_param}] CASDA 中未找到历史观测，跳过。")
@@ -208,8 +213,13 @@ def main() -> None:
 
                 for f in existing_files:
                     if os.path.getsize(f) > MIN_FILE_SIZE:
-                        is_complete = True
-                        break
+                        try:
+                            with fits.open(f) as hdul:
+                                is_complete = np.squeeze(hdul[0].data).ndim == 2
+                        except (OSError, ValueError, TypeError):
+                            is_complete = False
+                        if is_complete:
+                            break
 
                 if is_complete:
                     print(f"  -> [跳过] {sbid_full} (Stokes {stokes_param}) 数据已存在且完整。")
@@ -248,7 +258,8 @@ def main() -> None:
                             url_list = casda.stage_data(url_info_df)
                             if not url_list:
                                 raise RuntimeError("Staging 失败，未返回完整 FITS 下载链接")
-                            downloaded_files = casda.download_files(url_list, savedir=temp_dir)
+                            with quiet_casda_download():
+                                downloaded_files = casda.download_files(url_list, savedir=temp_dir)
                             if not downloaded_files:
                                 raise RuntimeError("完整 FITS 下载返回空文件列表")
 
@@ -305,7 +316,11 @@ def main() -> None:
                         break
 
                     except Exception as inner_e:
-                        batch_err_msg = str(inner_e)
+                        batch_err_msg = safe_download_error(inner_e)
+                        print(
+                            f"  -> [重试 {inner_attempt + 1}/{MAX_RETRIES}] "
+                            f"{hostname} - {sbid_full}: {batch_err_msg}"
+                        )
                         if inner_attempt < MAX_RETRIES - 1:
                             time.sleep(5)
                         else:

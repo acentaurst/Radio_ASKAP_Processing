@@ -15,11 +15,53 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def safe_download_error(error: Exception) -> str:
+    """Retain the failure cause without recording signed URLs or credentials."""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    summary = type(error).__name__
+    if status is not None:
+        summary += f" HTTP {status}"
+    body = getattr(response, "text", "") or ""
+    code = re.search(r"<Code>([A-Za-z0-9_]+)</Code>", body)
+    if code:
+        summary += f" {code.group(1)}"
+    detail = str(error).strip()
+    detail = re.sub(r"\?[^\s'\"<>]+", " [URL query redacted]", detail)
+    detail = re.sub(r"(https?://)[^/@\s]+@", r"\1[credentials redacted]@", detail)
+    detail = re.sub(
+        r"(?i)\bauthorization\s*[:=]\s*(?:Bearer|Basic)\s+[^\s,'\"<>]+",
+        "[sensitive value redacted]",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)\b(?:x-amz-signature|x-amz-credential|awsaccesskeyid|access_token|token|authorization|password|client_secret|api[_-]?key)\s*[:=]\s*[^\s,'\"<>]+",
+        "[sensitive value redacted]",
+        detail,
+    )
+    return summary + (f": {detail}" if detail else "")
+
+
+@contextmanager
+def quiet_casda_download():
+    """Hide astroquery's signed-URL INFO logs only during a file transfer."""
+    from astroquery import log as astroquery_log
+
+    previous_level = astroquery_log.level
+    astroquery_log.setLevel("WARNING")
+    try:
+        yield
+    finally:
+        astroquery_log.setLevel(previous_level)
 
 
 # ============================================================================
@@ -122,6 +164,100 @@ def propagated_phase_uncertainty(
     return abs(float(delta_time_days)) * float(period_error_days) / float(period_days) ** 2
 
 
+def resolve_phase_ephemeris(
+    result_file,
+    alias_rank,
+    use_manual,
+    manual_period_days,
+    manual_t0_bjd_tdb,
+    manual_err_minus_s,
+    manual_err_plus_s,
+):
+    """Resolve a complete BJD_TDB ephemeris from an alias table or manual values."""
+    if use_manual:
+        fields = (
+            manual_period_days,
+            manual_t0_bjd_tdb,
+            manual_err_minus_s,
+            manual_err_plus_s,
+        )
+        if any(value is None for value in fields):
+            raise ValueError("manual ephemeris requires P, T0 and both errors")
+        period, t0, minus, plus = map(float, fields)
+        delta_bic, selected_rank, source = None, None, "manual"
+    else:
+        path = Path(result_file)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        start = next(
+            (i for i, line in enumerate(lines)
+             if line.strip().startswith("| Alias rank |")),
+            None,
+        )
+        if start is None:
+            raise ValueError(f"No alias table in {path}")
+        headers = [
+            cell.strip()
+            for cell in lines[start].strip().strip("|").split("|")
+        ]
+        selected = None
+        for line in lines[start + 2:]:
+            if not line.strip().startswith("|"):
+                break
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) == len(headers):
+                row = dict(zip(headers, cells, strict=True))
+                if row.get("Alias rank") == str(alias_rank):
+                    selected = row
+                    break
+        if selected is None:
+            raise ValueError(f"Alias rank {alias_rank} is absent from {path}")
+        required = (
+            "Period (d)", "T0 (BJD_TDB)", "68% error - (s)",
+            "68% error + (s)", "Delta BIC",
+        )
+        missing = [column for column in required if column not in selected]
+        if missing:
+            raise ValueError(f"Alias row in {path} lacks columns: {missing}")
+        period = float(selected["Period (d)"])
+        t0 = float(selected["T0 (BJD_TDB)"])
+        minus = float(selected["68% error - (s)"])
+        plus = float(selected["68% error + (s)"])
+        delta_bic = float(selected["Delta BIC"])
+        selected_rank, source = int(alias_rank), str(path)
+
+    if not np.isfinite([period, t0, minus, plus]).all():
+        raise ValueError("Non-finite ephemeris value")
+    if period <= 0:
+        raise ValueError("P must be positive")
+    if minus < 0 or plus < 0:
+        raise ValueError("period errors must be non-negative")
+    return {
+        "period_days": period,
+        "t0_bjd_tdb": t0,
+        "period_err_minus_s": minus,
+        "period_err_plus_s": plus,
+        "alias_rank": selected_rank,
+        "delta_bic": delta_bic,
+        "source": source,
+    }
+
+
+def phase_coordinates(bjd_tdb, period_days, t0_bjd_tdb, fold_cycles):
+    """Return absolute cycle, phase mod 1, and the requested one/two-cycle display phase."""
+    if (fold_cycles not in (1, 2) or not np.isfinite(period_days)
+            or period_days <= 0):
+        raise ValueError("fold_cycles must be 1 or 2; period_days must be positive")
+    times = np.asarray(bjd_tdb, dtype=float)
+    if not np.isfinite(times).all() or not np.isfinite(t0_bjd_tdb):
+        raise ValueError("Phase input times and T0 must be finite BJD_TDB")
+    absolute_cycle = (times - t0_bjd_tdb) / period_days
+    phase_mod1 = np.mod(absolute_cycle, 1.0)
+    phase_display = (
+        phase_mod1 if fold_cycles == 1 else np.mod(absolute_cycle, 2.0)
+    )
+    return absolute_cycle, phase_mod1, phase_display
+
+
 def phase_bin_for_display(
     phase: np.ndarray,
     values: np.ndarray,
@@ -129,15 +265,20 @@ def phase_bin_for_display(
     errors: np.ndarray | None = None,
     min_count: int = 3,
     phase_max: float = 2.0,
+    statistic: str = "mean",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Bin phase-folded values across ``[0, phase_max)`` for display."""
+    """Bin phase-folded values across ``[0, phase_max)`` using mean or median."""
     phase = np.asarray(phase, dtype=float)
     values = np.asarray(values, dtype=float)
     input_errors = None if errors is None else np.asarray(errors, dtype=float)
+    if phase.shape != values.shape:
+        raise ValueError("display-bin phase and values must have the same shape")
     if input_errors is not None and input_errors.shape != values.shape:
         raise ValueError("display-bin errors must have the same shape as values")
-    if phase_max <= 0.0:
-        raise ValueError("phase_max must be positive")
+    if phase_max <= 0.0 or nbins < 1 or min_count < 1:
+        raise ValueError("phase_max, nbins and min_count must be positive")
+    if statistic not in {"mean", "median"}:
+        raise ValueError("statistic must be 'mean' or 'median'")
     finite = np.isfinite(phase) & np.isfinite(values)
     phase, values = phase[finite], values[finite]
     if input_errors is not None:
@@ -150,7 +291,10 @@ def phase_bin_for_display(
         in_bin = (phase >= edges[index]) & (phase < edges[index + 1])
         count = int(np.sum(in_bin))
         if count >= min_count:
-            binned[index] = np.nanmean(values[in_bin])
+            if statistic == "median":
+                binned[index] = np.nanmedian(values[in_bin])
+            else:
+                binned[index] = np.nanmean(values[in_bin])
             if count == 1 and input_errors is not None and np.isfinite(input_errors[in_bin][0]):
                 binned_errors[index] = input_errors[in_bin][0]
             else:
@@ -182,6 +326,24 @@ def retry_with_exponential_backoff(search_fn, label: str, max_retries: int = 3):
             if attempt < max_retries:
                 time.sleep(2 ** attempt)
     raise last_error
+
+
+# ============================================================================
+# Radio spectral models（频率和 pivot 使用相同单位；amplitude 与通量同单位）
+# ============================================================================
+
+def power_law_spectrum(
+    nu_mhz: np.ndarray,
+    amplitude: float,
+    alpha: float,
+    pivot_mhz: float,
+) -> np.ndarray:
+    """Evaluate S_nu = amplitude * (nu / pivot)**alpha for radio spectra.
+
+    ``amplitude`` is the flux density at ``pivot_mhz``; ``alpha`` is the
+    dimensionless spectral index. Both frequency arguments are in MHz.
+    """
+    return amplitude * (nu_mhz / pivot_mhz) ** alpha
 
 
 # ============================================================================
